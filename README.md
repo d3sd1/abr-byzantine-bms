@@ -1,3 +1,8 @@
+## Dataset
+
+El Tiemblo Solar+Storage LiFePO4 dataset (70 days, 22,524 samples) on Zenodo:
+**DOI [10.5281/zenodo.20717244](https://doi.org/10.5281/zenodo.20717244)** (CC-BY-4.0).
+
 # ABR Byzantine-Resilient BMS — Reproducibility Package
 
 Code and experiment scripts for the paper:
