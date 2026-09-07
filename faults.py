@@ -115,9 +115,15 @@ def apply_message_faults(build, name, seed, t_start_frac=0.25, **override):
       s_rep  (T,n)  SOC reports as received
       i_rep  (T,n)  current reports as received
       ev     (T,n)  node-declared estimator events (reset / OCV correction)
-      stale  (T,n)  True where the aggregator KNOWS the message is missing or
-                    late (sequence number / timestamp), so model-based
-                    consistency checks must not be run on it
+      src    (T,n)  index of the sample the held message actually carries, i.e.
+                    the SEQUENCE NUMBER the RS485 master reads off the frame.
+                    src[t,m] == t means a fresh reply; a stalled or receding
+                    src is exactly what a bus master observes when a slave
+                    misses its poll slot or answers with an old frame.  The
+                    detector derives message freshness from this and from
+                    nothing else -- no extra sensor is implied.
+      stale  (T,n)  legacy flag, kept so the round-2 iteration-0 behaviour
+                    remains reproducible; derived from src by the detector now
       t_start, targets
     """
     spec = CLASSES[name]
@@ -128,6 +134,7 @@ def apply_message_faults(build, name, seed, t_start_frac=0.25, **override):
     i = build['I_hat'].copy()
     ev = build['event'].copy()
     stale = np.zeros((T, n), dtype=bool)
+    src = np.repeat(np.arange(T)[:, None], n, axis=1)
     tgts = spec['targets']
 
     if spec['level'] == 'message':
@@ -191,18 +198,21 @@ def apply_message_faults(build, name, seed, t_start_frac=0.25, **override):
                 s[:, m] = s[idx, m]
                 i[:, m] = i[idx, m]
                 ev[:, m] = ev[idx, m]
+                src[:, m] = idx
             elif kind == 'delay':
                 dmin, dmax = spec['delay']
                 lag = rng.integers(dmin, dmax + 1, T)
-                src = np.maximum(np.arange(T) - lag, 0)
-                src[:t0] = np.arange(t0)
-                s[:, m] = s[src, m]
-                i[:, m] = i[src, m]
-                ev[:, m] = ev[src, m]
+                srcm = np.maximum(np.arange(T) - lag, 0)
+                srcm[:t0] = np.arange(t0)
+                s[:, m] = s[srcm, m]
+                i[:, m] = i[srcm, m]
+                ev[:, m] = ev[srcm, m]
+                src[:, m] = srcm
                 stale[t0:, m] = True     # timestamp shows the message is late
     s = np.clip(s, 0.0, 1.0)
-    return dict(s_rep=s, i_rep=i, ev=ev, stale=stale, t_start=t0, targets=list(tgts),
-                expected=spec['expected'], family=spec['family'])
+    return dict(s_rep=s, i_rep=i, ev=ev, stale=stale, src=src, t_start=t0,
+                targets=list(tgts), expected=spec['expected'],
+                family=spec['family'])
 
 
 def build_scenario(data, name, seed, lam=1.0, anchor='ocv', t_start_frac=0.25,
@@ -221,11 +231,13 @@ def build_scenario(data, name, seed, lam=1.0, anchor='ocv', t_start_frac=0.25,
         T, n = b['T'], b['s_hat'].shape[1]
         b.update(s_rep=b['s_hat'].copy(), i_rep=b['I_hat'].copy(),
                  ev_rx=b['event'].copy(), stale=np.zeros((T, n), dtype=bool),
+                 src=np.repeat(np.arange(T)[:, None], n, axis=1),
                  t_start=int(T * t_start_frac), targets=[], expected='none',
                  family='none')
         return b
     mf = apply_message_faults(b, name, seed, t_start_frac, **(msg_override or {}))
     b.update(s_rep=mf['s_rep'], i_rep=mf['i_rep'], ev_rx=mf['ev'],
-             stale=mf['stale'], t_start=mf['t_start'], targets=mf['targets'],
-             expected=mf['expected'], family=mf['family'])
+             stale=mf['stale'], src=mf['src'], t_start=mf['t_start'],
+             targets=mf['targets'], expected=mf['expected'],
+             family=mf['family'])
     return b

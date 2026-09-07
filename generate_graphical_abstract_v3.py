@@ -195,11 +195,11 @@ txt(c3 + lw_ * 0.55, fy - 0.42 - lh_ / 2 - 0.11,
 c4 = p4x + p4w / 2
 wy = PY + PH - 1.00
 txt(c4, wy + 0.28, "trust-weighted fusion", fs=8.5, fw="bold", fc=DEEP_BLUE)
-labels = ["trusted", "suspect", "battery", "quarantined"]
-colors = [GREEN, AMBER, LIGHT_BLUE, RED]
-weights = [0.80, 0.55, 0.10, 0.0]
+labels = ["trusted", "suspect", "battery", "comms-degraded", "quarantined"]
+colors = [GREEN, AMBER, LIGHT_BLUE, "#8e44ad", RED]
+weights = [0.80, 0.55, 0.10, 0.0, 0.0]
 for i, (lb, co, wv) in enumerate(zip(labels, colors, weights)):
-    yy = wy - 0.10 - i * 0.42
+    yy = wy - 0.06 - i * 0.35
     ax.add_patch(Circle((c4 - p4w * 0.32, yy), 0.075, fc=co, ec=co, zorder=6))
     txt(c4 - p4w * 0.32 + 0.17, yy, lb, fs=7.5, ha="left", fc=DARK)
     bar_x = c4 + p4w * 0.06
@@ -230,15 +230,18 @@ if RES.exists():
     e1 = R["E1p_ablation"]["_false_positive_check"]
     v3 = "EWMA + gap + router (v3)"
     r1 = "EWMA + gap (round-1 detector)"
+    fr = "EWMA + gap + message freshness"
     wrong_r1 = np.mean([e1[c][r1]["p_target_quarantined"]["mean"] for c in e1]) * 100
+    wrong_fr = np.mean([e1[c][fr]["p_target_quarantined"]["mean"] for c in e1]) * 100
     wrong_v3 = np.mean([e1[c][v3]["p_target_quarantined"]["mean"] for c in e1]) * 100
     node = [c for c in e7 if c.startswith("N")]
     det = np.mean([e7[c]["ABR-full"]["p_target_quarantined"]["mean"] for c in node]) * 100
     fix_fp = e7["none"]["Fixed 3 %"]["tpr_steps"]["mean"] * 100
     rmse = np.mean([e7[c]["ABR-full"]["rmse_consensus"]["mean"] for c in e7]) * 100
     stats = [
-        (f"{wrong_r1:.0f} → {wrong_v3:.0f} %",
-         "battery faults and link glitches\nwrongly quarantined (round 1 → v3)"),
+        (f"{wrong_r1:.0f}→{wrong_fr:.0f}→{wrong_v3:.0f} %",
+         "battery faults and link glitches wrongly quarantined:\n"
+         "round 1 → + message freshness → + physical router"),
         (f"{det:.0f} %", "true node faults detected\n(8 classes, 5 seeds)"),
         (f"{fix_fp:.0f} %", "steps a fixed 3 % threshold\nexcludes a healthy node"),
         (f"{rmse:.2f} %", "consensus SOC RMSE\nvs true pack SOC"),
@@ -248,8 +251,8 @@ else:
 sw_ = TW / len(stats)
 for i, (big, small) in enumerate(stats):
     cx = M + sw_ * (i + 0.5)
-    txt(cx, BY + BH - 0.34, big, fs=17, fw="bold", fc=WHITE)
-    txt(cx, BY + 0.28, small, fs=7.6, fc="#d6eaf8")
+    txt(cx, BY + BH - 0.34, big, fs=15.5, fw="bold", fc=WHITE)
+    txt(cx, BY + 0.26, small, fs=7.2, fc="#d6eaf8")
     if i:
         ax.plot([M + sw_ * i, M + sw_ * i], [BY + 0.12, BY + BH - 0.12],
                 color="#5499c7", lw=0.9, zorder=11)

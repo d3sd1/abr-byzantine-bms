@@ -1,11 +1,11 @@
 # Applied Energy round 2 — experimental results (v3 signal model)
 
 **Previous Ms.** APEN-D-26-09704R1 (REJECT with invitation to resubmit) · **Draft** `2026-abr-pinn-bms-byzantine`
-**Run:** 2026-09-05 · **Seeds:** 42, 123, 456, 789, 1024 (5) · **Subsample:** 2
+**Run:** 2026-09-05 (iteration 0), 2026-09-07 (iteration 1) · **Seeds:** 42, 123, 456, 789, 1024 (5) · **Subsample:** 2
 **Dataset:** El Tiemblo Solar+Storage LiFePO₄ 16s16p — 11 262 samples after subsampling, **808.3 h (33.7 days) of logged coverage** inside a 70-day calendar span (the log is event-driven and has gaps).
-**Total runtime:** 2 225.7 s (37.1 min, CPU only) · every number is raw script output.
+**Total runtime:** 2 225.7 s (37.1 min) for iteration 0 plus 1 696.0 s (28.3 min) for iteration 1, CPU only · every number is raw script output.
 
-Results: `results/revision2_results.json` · consolidated under the `v3` key of `results/aggregated_results.json`.
+Results: `results/revision2_results.json` (iteration 1, current) · `results/revision2_results_iter0.json` (iteration 0, preserved) · consolidated under the `v3` key of `results/aggregated_results.json`.
 Figures: `figures/figR6…figR9`, `figR1v3`, `figR2v3`, `figR5v3`.
 Reproduce: `python revision2_experiments.py` then `python generate_figures_v3.py`.
 
@@ -13,11 +13,126 @@ Reproduce: `python revision2_experiments.py` then `python generate_figures_v3.py
 > broad one. With signal-level fault injection and physically grounded module dispersion, the round-1 detector is
 > shown to wrongly quarantine a healthy-but-imbalanced module and two kinds of healthy link **65 % of the time**,
 > and to quarantine a healthy node in **8 %** of runs *with no fault present at all* — its reported zero false-positive
-> rate was an artefact of the report-level injection. Adding the physical-consistency router drives all of those to
-> **exactly 0** while keeping node-fault detection at 0.70. But three of the sixteen classes are simply not
+> rate was an artefact of the report-level injection. Two independent mechanisms fix this, and iteration 1
+> separates their contributions: **message freshness**, which any RS485 master already has, removes the packet-loss
+> and delay false quarantines (0.65 → 0.20), and the **physical-consistency router** removes the imbalance one
+> (0.20 → 0.00), while node-fault detection stays at 0.70. But three of the sixteen classes are simply not
 > observable in report space (voltage-sensor offset, internal short circuit, thermal rise), one attack that round 1
 > claimed as its best case (collusion) is **not detected at all**, and a trivial fixed threshold beats the detector on
 > raw sensitivity at every dispersion level — it just pays for it with a 23–67 % false-exclusion rate.
+
+---
+
+## Iteration 1 — three design changes, and what each one actually bought
+
+Three changes to the router, motivated by physics and by what an RS485 bus master already knows, not by
+inspecting the fault classes. Iteration 0 is preserved verbatim in `results/revision2_results_iter0.json`.
+
+### Change 1 (CUSUM persistence) — REJECTED by the pre-declared criterion
+
+**Premise tested:** a one-sample spike puts $+\delta$ into the residual and then $-\delta$, so the CUSUM should
+return to baseline, whereas a step change (collusion, firmware bias) persists. Requiring the excursion to last
+$P$ consecutive polls should therefore separate the two.
+
+**Calibration.** $P$ was to be $1.5\times$ the longest honest excursion above the CUSUM threshold in the
+fault-free calibration window. Measured: the longest honest excursion is **0 polls in the calibration window and
+0 over the entire fault-free horizon** — honest nodes never cross the threshold at all — so the rule yields
+**P = 1**, no persistence requirement. The calibration is vacuous on this data.
+
+**Why the premise fails.** The two accumulators are one-sided: the $+\delta$ of a spike lands in $S^+$ and the
+$-\delta$ in $S^-$, so nothing cancels. What sets the dwell above threshold is the disturbance *amplitude*
+divided by the CUSUM slack, not whether it was transient:
+
+| class | longest excursion (polls) | median excursion |
+|---|---|---|
+| G3 single-step spikes (±10 %) | **515** | 135 |
+| N5 firmware bias (+5 %) | 41 | 32 |
+| N6 collusion (+3 %) | **27** | 14 |
+| N7 stealth drift | 1242 | 58 |
+| N3 frozen report | 1242 | 47 |
+| N4 corruption, N8 random | 8436 | 8436 |
+| G1, G2, B1, B2, B3b, B4, N1 | 0 | 0 |
+
+The transient glitch dwells **19× longer** than the collusion it was meant to be separated from, because its
+amplitude is larger. No excursion-length threshold can order those two correctly.
+
+**A net-residual variant was also tried and rejected before the sweep.** Replacing the one-sided pair with the net
+accumulated residual $|\sum r|$ does make a spike cancel exactly, but its honest baseline drifts over the horizon:
+a threshold calibrated on the first 10 % of fault-free data is exceeded at some point by **34.7 % of healthy
+nodes**, violating the hard FPR = 0 constraint.
+
+**Sweep and selection (E12).** Criterion declared before looking at any outcome: *hard* — FPR exactly 0 on the
+fault-free control and zero quarantines on the eight must-not-quarantine classes; *score among those that pass* —
+highest mean P(quarantine) over the eight node-fault classes.
+
+| configuration | passes hard constraint | node-fault score | wrong-quarantine (8 classes) | N6 collusion | G3 spikes | N5 bias |
+|---|---|---|---|---|---|---|
+| router-first P=1 | **no** | 0.825 | 0.125 | 1.00 | **1.00** | 0.80 |
+| router-first P=2 | **no** | 0.825 | 0.125 | 1.00 | **1.00** | 0.80 |
+| router-first P=30 | **no** | 0.755 | 0.125 | 0.44 | **1.00** | 0.80 |
+| router-first P=520 | **no** | 0.600 | 0.050 | 0.00 | **0.40** | 0.00 |
+| **gap-first (v3) P=1** | **yes** | **0.700** | **0.000** | 0.00 | 0.00 | 0.80 |
+| gap-first (v3) P=520 | yes | 0.600 | 0.000 | 0.00 | 0.00 | 0.00 |
+
+**Selected: `gap-first (v3) P=1`** — the iteration-0 configuration. No persistence value rescues `router-first`:
+at P = 1, 2 and 30 it still quarantines the spike glitch in 5/5 seeds, and by P = 520, where the spike is finally
+suppressed in 3/5 seeds, collusion *and* firmware bias have both collapsed to 0.00. **N6 collusion therefore
+remains undetected**, exactly as in iteration 0.
+
+### Change 2 (comms-degraded state) — ADOPTED; it is what fixes the link glitches
+
+A held reply is stale when its sequence number did not advance since the previous poll or its age exceeds two poll
+cycles. A stale node is marked `comms-degraded`: excluded from that step's consensus, EWMA frozen, no router
+evidence accrued, trust untouched, automatic recovery. This is read off the frame by any bus master — no extra
+sensor and no extra traffic.
+
+| class | P(comms-degraded) | steps degraded | P(battery-anomaly) before → after | P(trusted) before → after | P(quarantine) |
+|---|---|---|---|---|---|
+| G1 packet loss | 1.00 | 20.7 % | 0.87 → **0.07** | 0.00 → **0.87** | 0.00 → **0.00** |
+| G2 message delay | 1.00 | 100 % | 1.00 → **0.00** | 0.00 → **1.00** | 0.00 → **0.00** |
+| G3 spikes | 0.00 | 0 % | 0.00 → 0.00 | 0.80 → 0.80 | 0.00 → 0.00 |
+| no fault (control) | 0.00 | 0 % | 0.00 → 0.00 | 1.00 → 1.00 | 0.00 → 0.00 |
+
+Healthy nodes are never marked comms-degraded (0.000 across all 17 scenarios) and the fault-free control is
+unchanged. Every other row of E7 is bit-identical to iteration 0.
+
+### Change 3 (E10 re-check) — the iteration-0 conclusion was wrong and is withdrawn
+
+Comparing net charge throughput with the net SOC change over 70 days is not a valid consistency test, because the
+BMS re-anchors its counter at every full charge. Done correctly, between re-anchoring events, **the declared
+4480 Ah group capacity is consistent with the data to within 16 %**. See the revised E10 section.
+
+### Attribution: which mechanism removes which false quarantine
+
+P(target wrongly quarantined), mean over 5 seeds, on the four classes of E1'. The same ordering holds over all
+eight must-not-quarantine classes (0.325 → 0.100 → 0.000).
+
+| detector | B1 aging | B2 imbalance | G1 packet loss | G2 delay | mean |
+|---|---|---|---|---|---|
+| EWMA trust only | 0.00 | 0.00 | 0.00 | 0.00 | 0.000 |
+| Gap only (no trust grading) | 0.00 | 0.80 | 0.00 | 0.00 | 0.200 |
+| **EWMA + gap (round-1 detector)** | 0.00 | **0.80** | **0.80** | **1.00** | **0.650** |
+| EWMA + gap + message freshness | 0.00 | 0.80 | 0.00 | 0.00 | 0.200 |
+| **EWMA + gap + router (v3 final)** | 0.00 | **0.00** | **0.00** | **0.00** | **0.000** |
+
+**The iteration-0 report attributed the whole 0.65 → 0.00 improvement to the router. That was wrong.** Message
+freshness accounts for 0.65 → 0.20 (packet loss and delay) and the router for the remaining 0.20 → 0.00
+(imbalance). The router's unique contribution is narrower than iteration 0 claimed, and the cheaper mechanism —
+information the bus master already has — does more of the work.
+
+### What was re-run, and what changed
+
+| experiment | re-run | affected by the iteration-1 changes |
+|---|---|---|
+| E7 fault-class matrix | yes | yes — G1 and G2 rows only |
+| E1' ablation | yes | yes — two variants added for the attribution |
+| E8 dispersion sweep | yes | only the G1 rows; N5, N1, B1 identical to iteration 0 |
+| E12 persistence sweep | new | — |
+| E10 calibration | yes | no, but re-checked as instructed (change 3) |
+| E9 magnitude sweep | yes | **no** — zero changed values vs iteration 0 |
+| E11 voltage anchor | yes | **no** — zero changed values vs iteration 0 |
+| E6' centralised vs distributed | yes | **no** — zero changed values vs iteration 0 |
+| E2' gap sweep | yes | consensus RMSE only (the sweep pools G1); TPR, FPR, quarantine rates identical |
 
 ---
 
@@ -36,22 +151,38 @@ Both are fixed in the v3 modules; the round-1 scripts are left untouched as prov
 
 These are measurements, not modelling choices, and they are reported because they change what the paper may claim.
 
-1. **The SOC channel is not consistent with the logged cell voltages.**
-   `corr(inv_OCV(V_pack/16), SOC_bms) = −0.349` — negative. Where the BMS reports SOC ≈ **1.3 %**, the minimum
-   and maximum cells sit at an OCV-implied **70.1 %** and **99.1 %**. Absolute voltage→SOC re-anchoring would drag
-   every local estimate by 40–70 SOC points, and a voltage-triggered full-charge reset fires hundreds of times at
-   low pack SOC. Neither is usable on this pack.
-2. **The current channel is not consistent with the SOC channel either.**
-   ∫I dt = **+1 554 Ah** net over the window while the SOC ends **9 points below** where it started (mean I_pack
-   = +3.2 A). An open-loop Coulomb counter has ≈0.55 SOC RMSE against the reference for *any* assumed capacity
-   (4480 / 9600 / 2000 Ah all give 0.55–0.60).
+1. **The voltage channel and the SOC channel disagree on more than half the record.**
+   Taking the mid-envelope cell voltage, |inv_OCV(V_mid) − SOC_bms| exceeds 20 SOC points in **55.4 %** of samples
+   (**68.6 %** of at-rest samples), with a median discrepancy of **21.9 points** (26.7 at rest), and
+   `corr(inv_OCV(V_pack/16), SOC_bms) = −0.349`. The discrepancy is **not** confined to the start of the record:
+   it affects 74.2 % of samples in the first half of the covered days and still 54.5 % in the second half, running
+   at 84–100 % on days 2–5 and falling below 10 % only on days 30–32. Whatever the cause, voltage-based SOC
+   re-anchoring cannot be used as an absolute reference on this pack over this window; the local estimator
+   therefore uses only the *differential* part of the voltage information, bounded and applied at the OCV knees.
+2. **The current channel *is* consistent with the SOC channel once the test is done correctly.**
+   *This corrects the iteration-0 conclusion, which is withdrawn.* Comparing net throughput (∫I dt = +1 554 Ah)
+   with the net SOC change (−9 points) over 70 days is not a valid test, because the BMS re-anchors its counter at
+   every full charge. Cutting the record at every re-anchoring event (SOC jump > 2 points, SOC ≥ 95 %, or a log
+   gap ≥ 300 s) and regressing ΔSOC_bms on the charge integral within each segment gives, over **25 usable
+   segments (1 999 samples)**:
+
+   | assumed capacity | slope β (1 = perfect) | R² | implied effective capacity |
+   |---|---|---|---|
+   | 280 Ah (single cell) | 0.054 | 0.324 | 5 196 Ah |
+   | **4 480 Ah (16p group, declared)** | **0.862** | 0.324 | **5 196 Ah** |
+
+   Pearson r between ΔSOC and ΔAh across segments is **0.711**. The declared 16s16p group capacity is the right
+   one — it is off by 16 %, not by the factor of 18.5 that the single-cell figure would imply — and the earlier
+   claim that "no assumed capacity fits" was an artefact of ignoring the re-anchoring events.
 
 **Consequence for the model.** Each node runs a *differential* estimator: the common mode comes from the pack
 shunt (which every node on the RS485 bus reads) and the node contributes its own module-level deviation,
 integrated from (own current − pack current) over the nominal group capacity, plus a bounded differential OCV
 correction that uses only the gap between its own cell voltage and the pack average cell voltage. This is what a
 distributed BMS actually does, and it places the experiment where the paper's claim lives: detecting **node-level
-deviations**, not absolute SOC.
+deviations**, not absolute SOC. Note that finding (2) now *supports* the choice of 4 480 Ah as the counter
+capacity, which is what the differential estimator uses; the differential structure is motivated by finding (1)
+and by the fact that the absolute common mode is not the quantity the detector operates on.
 
 ---
 
@@ -63,35 +194,36 @@ signal (N1, N2, B1–B4) or on a message (N3–N8, G1–G3), never by editing th
 
 P(target node ends in each state), mean over 5 seeds:
 
-| Class | expected | ABR **with** router (v3) | ABR **without** router (round 1) | ABR router-first | fixed 3 % (steps excl.) | Med/MAD (steps excl.) |
-|---|---|---|---|---|---|---|
-| N1 current offset +5 A | quarantine | **Q 0.80**, S 0.20 | Q 0.80 | Q 0.80 | 0.80 | 0.70 |
-| N2 voltage offset +50 mV | quarantine | T 0.80, S 0.20 | T 0.80 | T 0.80 | 0.40 | 0.01 |
-| N3 frozen report | quarantine | **Q 1.00** | Q 1.00 | Q 1.00 | 0.84 | 0.83 |
-| N4 message corruption | quarantine | **Q 1.00** | Q 1.00 | Q 1.00 | 0.95 | 0.77 |
-| N5 firmware bias +5 % | quarantine | **Q 0.80**, S 0.20 | Q 0.80 | Q 0.80 | 0.60 | 0.18 |
-| N6 collusion (5 nodes, +3 %) | quarantine | T 0.96, S 0.04 | T 0.96 | **Q 1.00** | 0.13 | 0.00 |
-| N7 stealth drift | quarantine | **Q 1.00** | Q 1.00 | Q 1.00 | 0.99 | 0.98 |
-| N8 random report | quarantine | **Q 1.00** | Q 1.00 | Q 1.00 | 0.94 | 0.77 |
-| G1 packet loss (bursty) | no quarantine | Q 0.00, **B 0.87** | **Q 0.80** | Q 0.00 | 0.23 | 0.01 |
-| G2 message delay | no quarantine | Q 0.00, **B 1.00** | **Q 1.00** | Q 0.00 | 0.44 | 0.07 |
-| G3 single-step spikes | no quarantine | Q 0.00, T 0.80 | Q 0.00 | **Q 1.00** | 0.34 | 0.00 |
-| B1 aging (−15 % capacity) | no quarantine | Q 0.00, T 0.80 | Q 0.00 | Q 0.00 | 0.28 | 0.00 |
-| B2 imbalance (−8 SOC pts) | no quarantine | Q 0.00, **B 0.80** | **Q 0.80** | Q 0.00 | 0.39 | 0.11 |
-| B3 internal short 33 Ω | no quarantine | Q 0.00, **T 1.00** | Q 0.00 | Q 0.00 | 0.33 | 0.00 |
-| B3b internal short, severe | no quarantine | Q 0.00, **T 1.00** | Q 0.00 | Q 0.00 | 0.37 | 0.00 |
-| B4 thermal +5 °C | no quarantine | Q 0.00, **T 1.00** | Q 0.00 | Q 0.00 | 0.34 | 0.00 |
-| **no fault (control)** | — | Q 0.00, T 1.00 | Q 0.00 | Q 0.00 | **0.34** | 0.00 |
+| Class | expected | round-1 detector | + message freshness | **+ router = v3 final** | ABR router-first | fixed 3 % (steps excl.) | Med/MAD (steps excl.) |
+|---|---|---|---|---|---|---|---|
+| N1 current offset +5 A | quarantine | Q 0.80 | Q 0.80 | **Q 0.80**, S 0.20 | Q 0.80 | 0.80 | 0.70 |
+| N2 voltage offset +50 mV | quarantine | T 0.80 | T 0.80 | T 0.80, S 0.20 | T 0.80 | 0.40 | 0.01 |
+| N3 frozen report | quarantine | Q 1.00 | Q 1.00 | **Q 1.00** | Q 1.00 | 0.84 | 0.83 |
+| N4 message corruption | quarantine | Q 1.00 | Q 1.00 | **Q 1.00** | Q 1.00 | 0.95 | 0.77 |
+| N5 firmware bias +5 % | quarantine | Q 0.80 | Q 0.80 | **Q 0.80**, S 0.20 | Q 0.80 | 0.60 | 0.18 |
+| N6 collusion (5 nodes, +3 %) | quarantine | T 0.96 | T 0.96 | T 0.96, S 0.04 | **Q 1.00** | 0.13 | 0.00 |
+| N7 stealth drift | quarantine | Q 1.00 | Q 1.00 | **Q 1.00** | Q 1.00 | 0.99 | 0.98 |
+| N8 random report | quarantine | Q 1.00 | Q 1.00 | **Q 1.00** | Q 1.00 | 0.94 | 0.77 |
+| G1 packet loss (bursty) | no quarantine | **Q 0.80** | Q 0.00, C 1.00 | **Q 0.00**, B 0.07, T 0.87 | Q 0.00 | 0.23 | 0.01 |
+| G2 message delay | no quarantine | **Q 1.00** | Q 0.00, C 1.00 | **Q 0.00**, T 1.00 | Q 0.00 | 0.44 | 0.07 |
+| G3 single-step spikes | no quarantine | Q 0.00 | Q 0.00 | **Q 0.00**, T 0.80 | **Q 1.00** | 0.34 | 0.00 |
+| B1 aging (−15 % capacity) | no quarantine | Q 0.00 | Q 0.00 | **Q 0.00**, T 0.80 | Q 0.00 | 0.28 | 0.00 |
+| B2 imbalance (−8 SOC pts) | no quarantine | **Q 0.80** | **Q 0.80** | **Q 0.00**, B 0.80 | Q 0.00 | 0.39 | 0.11 |
+| B3 internal short 33 Ω | no quarantine | Q 0.00 | Q 0.00 | **Q 0.00**, T 1.00 | Q 0.00 | 0.33 | 0.00 |
+| B3b internal short, severe | no quarantine | Q 0.00 | Q 0.00 | **Q 0.00**, T 1.00 | Q 0.00 | 0.37 | 0.00 |
+| B4 thermal +5 °C | no quarantine | Q 0.00 | Q 0.00 | **Q 0.00**, T 1.00 | Q 0.00 | 0.34 | 0.00 |
+| **no fault (control)** | — | Q 0.00 | Q 0.00 | Q 0.00, T 1.00 | Q 0.00 | **0.34** | 0.00 |
 
-Q = quarantined, B = battery-anomaly, S = suspect only, T = trusted.
+Q = quarantined, B = battery-anomaly, C = comms-degraded, S = suspect only, T = trusted. "round-1 detector" is the iteration-0 configuration (no router, no message freshness).
 
 False positives on the 15 healthy nodes, averaged over all 17 scenarios:
 
 | Detector | mean FPR (steps) | P(a healthy node is ever excluded) | FPR in the **fault-free** control |
 |---|---|---|---|
-| **ABR with router (v3)** | **0.0000** | **0.000** | **0.0000 ± 0.0000** |
+| **ABR with router (v3 final)** | **0.0000** | **0.000** | **0.0000 ± 0.0000** |
 | ABR router-first | 0.0000 | 0.000 | 0.0000 ± 0.0000 |
-| ABR without router (round 1) | 0.0120 | 0.097 | 0.0106 ± 0.0182 |
+| ABR + freshness, no router | 0.0121 | 0.098 | 0.0106 ± 0.0182 |
+| ABR round-1 (no router, no freshness) | 0.0120 | 0.097 | 0.0106 ± 0.0182 |
 | Median/MAD z>3 | 0.0298 | 0.359 | 0.0306 ± 0.0198 |
 | Fixed 5 % | 0.1402 | 0.474 | 0.1413 ± 0.0488 |
 | Fixed 3 % | 0.2274 | 0.621 | 0.2241 ± 0.0429 |
@@ -101,10 +233,11 @@ Detection latency (ABR with router, mean over seeds that detect): N8 **0.1 h**, 
 N3 **55.2 h**, N1 **143.1 h**, N5 **198.7 h**. Consensus RMSE against the true mean module SOC ranges
 0.0081 (B1) to 0.0149 (N6).
 
-**Conclusion (one line):** The router is what makes the central claim true — without it the detector quarantines an
-imbalanced module, a lossy link and a delayed link in 80–100 % of runs, and a healthy node in 8 % of fault-free
-runs; with it, **no battery fault and no glitch is ever quarantined (0.00 across 8 classes × 5 seeds) while 6 of the
-8 node-fault classes are still caught**, but the two it misses (voltage offset, collusion) are missed completely.
+**Conclusion (one line):** Two mechanisms are needed and they are separable — message freshness removes the
+packet-loss and delay false quarantines (0.80 and 1.00 → 0.00) and the physical router removes the imbalance one
+(0.80 → 0.00), so that **no battery fault and no glitch is ever quarantined (0.00 across 8 classes × 5 seeds) while
+6 of the 8 node-fault classes are still caught**; the two that are missed (voltage offset, collusion) are missed
+completely, and the round-1 detector quarantines a healthy node in 8 % of fault-free runs.
 
 ---
 
@@ -180,6 +313,14 @@ reported as such.
 | module SOC dispersion, IQR | — (not measurable) | 0.0111 | 0.0232 | 0.1209 |
 | module SOC dispersion, p95 | — | 0.0244 | 0.0989 | 0.3221 |
 
+**Iteration-1 additions.** Segment-wise capacity consistency, 25 usable segments / 1 999 samples between
+re-anchoring events: slope beta = **0.862** against the declared 4 480 Ah group capacity (R2 = 0.324, implied
+effective capacity **5 196 Ah**, i.e. 16 % above nameplate), versus beta = 0.054 against a 280 Ah single-cell
+capacity; Pearson r between segment dSOC and dAh = 0.711. Voltage-channel inconsistency:
+|inv_OCV(V_mid) - SOC_bms| > 20 SOC points in **55.4 %** of samples (**68.6 %** at rest), median discrepancy
+**21.9** points (26.7 at rest), spread across the record rather than confined to its start (74.2 % of samples in
+the first half of the covered days, 54.5 % in the second, 84-100 % on days 2-5, below 10 % only on days 30-32).
+
 Router thresholds calibrated on fault-free data, first 10 % of the horizon, 5 seeds, percentile 99.9, margin 1.5:
 **th_cI = 4.791** (pooled honest p99.9 = 3.194; honest max in window = 3.695), **th_CUSUM = 3.8 × 10⁻⁵**
 (honest max in window = 2.6 × 10⁻⁵), **slack = 9.74 × 10⁻⁴** (pooled honest p99.9 of the residual). The CUSUM
@@ -187,9 +328,11 @@ threshold generalises: the honest CUSUM over the **full** horizon reaches 4.4 ×
 same order as the calibration window, because the report quantisation error telescopes.
 
 **Conclusion (one line):** The voltage envelope of the simulated pack reproduces the real one to within 0.1 % of a
-volt at the mean and the p95, so the honest dispersion is anchored to a measured quantity — **but the SOC
-dispersion cannot be validated against the dataset at all, because this pack only logs min/max cell voltages, and
-those are not OCV-consistent with its own SOC channel.**
+volt at the mean and the p95, so the honest dispersion is anchored to a measured quantity; the **charge** channel
+is consistent with the SOC channel once the comparison is made between re-anchoring events (beta = 0.86 at the
+declared group capacity), which is the iteration-1 correction — **but the SOC dispersion itself still cannot be
+validated against the dataset, because this pack logs only min/max cell voltages and those disagree with its own
+SOC channel by more than 20 points in 55 % of samples.**
 
 ---
 
@@ -279,7 +422,7 @@ which the detector does not catch, the distributed scheme gives **no benefit wha
 
 ## Unfavourable results
 
-Listed explicitly, because several of them narrow the paper's claims.
+Listed explicitly, because several of them narrow the paper's claims. Items 15-18 are new in iteration 1.
 
 1. **Internal short circuit is invisible in report space (answers R2 negatively).** The specified 33 Ω short draws
    0.1 A, which at the declared 4480 Ah group capacity is 0.054 %/day. A severity-matched variant (B3b, 2.06 Ω,
@@ -312,16 +455,38 @@ Listed explicitly, because several of them narrow the paper's claims.
    be carried over.
 10. **The round-1 detector's reported zero false-positive rate does not survive.** On the v3 model it is 0.0120
     overall and **0.0106 in the fault-free control**, quarantining a healthy node in 8 % of runs with no fault present.
-11. **Glitches are routed to the wrong label.** G1 and G2 are correctly *not* quarantined but are flagged
-    `battery-anomaly` (0.87 and 1.00), which is a misclassification: the router only has two outcomes and a
-    degraded link matches neither. A comms-health outcome is missing from the design.
+11. **Glitches were routed to the wrong label — FIXED in iteration 1, partially.** In iteration 0, G1 and G2 were
+    correctly *not* quarantined but were flagged `battery-anomaly` (0.87 and 1.00). The `comms-degraded` state
+    removes that: G2 is now 0.00 and G1 is 0.07. The residual 0.07 on G1 is a genuine remaining misclassification —
+    in one seed of five, a packet-loss node still ends up carrying a battery-anomaly flag between bursts.
 12. **PBFT-BMS trimmed mean has a 62 % false-exclusion rate by construction** (it trims 10 of 16 nodes every
     step). It is included for completeness, but the comparison is structural rather than informative.
 13. **Table 11's invariance is only half-answered.** Consensus RMSE still varies by under 2 % relative across the
     three anchoring schemes (E11); only the *detection decision* changes.
 14. **Trust grading contributes nothing measurable.** Gap-only and EWMA+gap give identical TPR/FPR to three
     decimals on all four ablation classes. The round-1 claim that the asymmetric EWMA "keeps FPR at exactly 0"
-    does not reproduce — the router does that.
+    does not reproduce — message freshness and the router do that.
+15. **The CUSUM persistence idea does not work, and the reasoning behind it was wrong (iteration 1).** The premise
+    was that a spike's +delta and -delta cancel in the CUSUM. They do not: the accumulators are one-sided, so the
+    two halves land in different ones and nothing cancels. Dwell above threshold is set by amplitude, so the 10 %
+    spike glitch dwells 515 polls against 27 for the 3 % collusion it was meant to be separated from. The
+    calibration rule for P is also vacuous here (honest nodes never cross the threshold, so P = 1). A net-residual
+    variant that *does* cancel spikes was rejected because its honest baseline drifts and 34.7 % of healthy nodes
+    cross the calibrated threshold. **No tested configuration detects collusion without quarantining a glitch.**
+16. **The iteration-0 attribution of the false-positive fix to the router was wrong (iteration 1).** Of the
+    0.65 -> 0.00 reduction in wrong quarantines, 0.65 -> 0.20 comes from message freshness — information any RS485
+    master already has — and only 0.20 -> 0.00 from the physical router. The router's unique contribution is the
+    imbalance case alone.
+17. **A persistently late node is effectively excluded for good (iteration 1).** G2 is `comms-degraded` in 100 % of
+    steps, so its report never enters the consensus. This is defensible engineering — 20-minute-old data should not
+    fuse into an instantaneous estimate — but it is a permanent exclusion in effect, differing from quarantine only
+    in that no trust penalty is applied and recovery is automatic.
+18. **The iteration-0 claim that the current and SOC channels are mutually inconsistent was wrong and is withdrawn
+    (iteration 1).** Tested correctly between re-anchoring events, the declared 4 480 Ah group capacity fits with
+    slope 0.86 (R2 = 0.32). The earlier "no capacity fits" statement came from comparing net throughput with net
+    SOC change across 70 days, which ignores that the BMS re-anchors at every full charge. The voltage-channel
+    inconsistency (item: 55.4 % of samples beyond 20 points) stands, but it must be worded as a bounded,
+    quantified disagreement rather than as the channel being unusable.
 
 ---
 
@@ -329,15 +494,15 @@ Listed explicitly, because several of them narrow the paper's claims.
 
 | Reviewer point | Answered by | Key number |
 |---|---|---|
-| **R1.1** faults injected at report level; aging-vs-attack never tested | **E7**, **E1'**, figR9 | Signal-level injection across 16 classes. Round-1 detector wrongly quarantines B2/G1/G2 at **0.80/0.80/1.00**; with the router, **0.00/0.00/0.00**, while 6 of 8 node-fault classes are still caught. Aged module (B1): report shift ≤ 0.7 % SOC vs 5.7 points of true drift → trusted 4/5 |
-| **R1.1** glitches must not be quarantined | **E7** | G1, G2, G3 quarantined **0.00** by the v3 detector (vs 0.80, 1.00, 0.00 without the router) |
+| **R1.1** faults injected at report level; aging-vs-attack never tested | **E7**, **E1'**, figR9 | Signal-level injection across 16 classes. Round-1 detector wrongly quarantines B2/G1/G2 at **0.80/0.80/1.00**; message freshness fixes G1/G2 and the router fixes B2, giving **0.00/0.00/0.00**, while 6 of 8 node-fault classes are still caught. Aged module (B1): report shift ≤ 0.7 % SOC vs 5.7 points of true drift → trusted 4/5 |
+| **R1.1** glitches must not be quarantined | **E7**, **E12** | G1, G2, G3 quarantined **0.00** by the v3 final detector (vs 0.80, 1.00, 0.00 for the round-1 detector); G1/G2 now carry a `comms-degraded` label instead of a battery-anomaly one |
 | **R1.2** modules are near-copies; detection is easy by physics | **E8**, **E9**, **E10** | Honest dispersion is now an output: IQR **2.3 %**, p95 **9.9 %**, MAD **1.3 %** at λ=1, against a voltage envelope matching the measured one (0.179 V vs 0.178 V mean). Minimum detectable bias **2.4–4.0 MAD**; a fixed 3 % threshold reaches higher TPR but excludes a healthy node in **22–67 %** of steps (**34 %** with no fault at all) |
 | **R1.2** compare against a trivial fixed threshold | **E7**, **E8** | Fixed 3 % / fixed 5 % / Median-MAD / PBFT included at every λ. Fixed 3 % wins on TPR, loses on FPR by 22–67 points |
 | **R2** no evidence on **internal short circuit** | **E7** (B3, B3b) | Trusted **5/5 seeds** at both severities; 1.6 A leakage moves true SOC 23 points but the report ≤ 3.9 % — **the method cannot diagnose it, and the paper must not claim it** |
 | **R2** no evidence on **cell imbalance** | **E7** (B2), **E1'** | −8 SOC-point imbalance: **battery-anomaly 0.80**, quarantined **0.00** with the router; quarantined **0.80** without it |
 | **R2** claims are broader than the evidence | **Unfavourable results** §1–14 | Collusion undetected (0.00), voltage offset undetected (0.00), thermal invisible, centralised-vs-distributed advantage 1.0×–4.2× not 8×–98× |
 | **Table 11** per-module detail does not contribute | **E11** | RMSE still nearly invariant (0.00822–0.00839, <2 % relative), but N5 detection falls **0.80 → 0.40 → 0.20** across OCV / rank / legacy anchoring |
-| Detector component contributions | **E1'**, **E2'** | Gap does the detecting; trust grading adds nothing measurable; router takes wrong-quarantine from **0.65 → 0.00**; FPR is 0 across δ ∈ [1,7] |
+| Detector component contributions | **E1'**, **E2'**, **E12** | Gap does the detecting; trust grading adds nothing measurable; **message freshness takes wrong-quarantine 0.65 → 0.20 and the router 0.20 → 0.00**; FPR is 0 across δ ∈ [1,7]; CUSUM persistence was tested over P ∈ {1,2,30,520} and rejected |
 
 **Net.** Every reviewer point that can be settled by computation is settled with real 5-seed results on 808 h of
 field data. Two of the settlements are negative — the method does not detect internal short circuit, thermal

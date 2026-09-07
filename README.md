@@ -48,11 +48,12 @@ full-rate `dt` after subsampling, under-counting charge throughput by ~2x.
 | `config_v3.json` | Every parameter: signal model, fault classes, detector, router thresholds, seeds |
 | `signal_model.py` | Per-module signal reconstruction anchored to the measured cell-voltage envelope + honest local estimator |
 | `faults.py` | 16 fault classes in three families (node / glitch / battery), injected at signal or message level |
-| `abr_detector.py` | Statistical detector + physical-consistency router, and all baselines |
-| `revision2_experiments.py` | E7–E11 and E1'/E2'/E6' |
+| `abr_detector.py` | Statistical detector, physical-consistency router, message-freshness (`comms-degraded`) handling, and all baselines |
+| `revision2_experiments.py` | E7–E12 and E1'/E2'/E6' |
 | `generate_figures_v3.py` | figR6–figR9, figR1v3, figR2v3, figR5v3 |
 | `generate_graphical_abstract_v3.py` | Graphical abstract (numbers read from the results JSON) |
-| `results/revision2_results.json` | All round-2 results, mean ± std over 5 seeds plus per-seed values |
+| `results/revision2_results.json` | Round-2 results, iteration 1 (current): mean ± std over 5 seeds plus per-seed values |
+| `results/revision2_results_iter0.json` | Round-2 results, iteration 0, preserved for the before/after comparison |
 | `results/aggregated_results.json` | Consolidated; round-2 results live under the `v3` key |
 | `REVISION2_RESULTS.md` | Round-2 findings, including the unfavourable ones |
 | `REVISION_RESULTS.md` | Round-1 findings (provenance) |
@@ -101,6 +102,16 @@ python generate_graphical_abstract_v3.py # graphical abstract
 `config_v3.json` under `detector.router`, and then freezes them. The thresholds
 are never set by looking at the fault classes.
 
+It then runs **E12**, the CUSUM-persistence sweep, and picks the detector
+configuration used by the rest of the suite with a criterion declared in
+advance in `config_v3.json`: false-positive rate exactly zero on the fault-free
+control and zero quarantines on the eight classes that must not be quarantined,
+and among the configurations that pass, the highest mean probability of
+quarantining the target across the eight node-fault classes. On the current
+data this selects `gap-first, P=1` — i.e. persistence is rejected. See
+`REVISION2_RESULTS.md`, "Iteration 1", for why, and for the separation between
+what message freshness contributes and what the physical router contributes.
+
 Every stochastic experiment runs over the 5 fixed seeds 42, 123, 456, 789, 1024;
 reported metrics are mean ± std over those seeds, and the per-seed values are
 stored in the JSON.
@@ -108,8 +119,10 @@ stored in the JSON.
 ### Measured runtime
 
 `revision2_experiments.py`: **see `_meta.runtime_seconds` in
-`results/revision2_results.json`** (about 30 minutes on a CPU-only desktop,
-single-threaded NumPy). Figures add roughly one minute.
+`results/revision2_results.json`** — 1 696 s (28.3 min) for iteration 1 on a
+CPU-only desktop with single-threaded NumPy; iteration 0 took 2 226 s
+(37.1 min) before E12 was added and before the detector loop was segmented.
+Figures add roughly one minute, the graphical abstract a few seconds.
 
 ## Reproducing the round-1 results (provenance)
 

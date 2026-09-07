@@ -36,7 +36,11 @@ from signal_model import (  # noqa: E402
 from faults import build_scenario, CLASSES, ORDER, TARGET  # noqa: E402
 from abr_detector import (  # noqa: E402
     ABRDetector, MedianMADDetector, FixedThresholdDetector, PBFTTrimmedMean,
-    CentralisedMean, STATE_NAMES, TRUSTED, SUSPECT, QUARANTINED, BATTERY)
+    CentralisedMean, STATE_NAMES, TRUSTED, SUSPECT, QUARANTINED, BATTERY,
+    message_freshness, router_stats)
+
+MUST_NOT_QUARANTINE = [c for c in ORDER if CLASSES[c]['expected'] == 'no-quarantine']
+NODE_CLASSES = [c for c in ORDER if CLASSES[c]['family'] == 'node']
 
 SEEDS = [42, 123, 456, 789, 1024]
 SUBSAMPLE = 2
@@ -73,6 +77,17 @@ def evaluate(res, sc):
     rmse = float(np.sqrt(np.mean((res['cons'] - sc['soc_pack_true']) ** 2)))
     mae = float(np.mean(np.abs(res['cons'] - sc['soc_pack_true'])))
 
+    dg = res.get('degraded')
+    if dg is None:
+        dg = np.zeros_like(excl)
+    comms_t = float(dg[ts:][:, tg].mean()) if tg else 0.0
+    comms_h = float(dg[:, heal].mean()) if heal else 0.0
+    ever_c = res.get('ever_comms')
+    if ever_c is None:
+        ever_c = dg.any(axis=0)
+    p_comms_t = float(np.mean([bool(ever_c[m]) for m in tg])) if tg else 0.0
+    p_comms_h = float(np.mean([bool(ever_c[m]) for m in heal])) if heal else 0.0
+
     worst = res['worst']
     part = {k: 0.0 for k in STATE_NAMES}
     for m in tg:
@@ -90,14 +105,21 @@ def evaluate(res, sc):
         p_target_trusted=part['trusted'],
         p_healthy_quarantined=heal_part['quarantined'],
         p_healthy_battery=heal_part['battery-anomaly'],
+        p_target_comms_degraded=p_comms_t,
+        p_healthy_comms_degraded=p_comms_h,
+        frac_steps_comms_target=comms_t,
+        frac_steps_comms_healthy=comms_h,
         rmse_consensus=rmse, mae_consensus=mae)
 
 
-def detector_bank(kw, full=True):
+def detector_bank(kw, full=True, persist=1):
     d = {
-        'ABR-full': ABRDetector(router=True, **kw),
+        'ABR-full': ABRDetector(router=True, cusum_persistence=persist, **kw),
+        'ABR-round-1 (no router, no freshness)':
+            ABRDetector(router=False, comms_state=False, **kw),
         'ABR-no-router': ABRDetector(router=False, **kw),
-        'ABR-router-first': ABRDetector(router=True, router_first=True, **kw),
+        'ABR-router-first': ABRDetector(router=True, router_first=True,
+                                        cusum_persistence=persist, **kw),
         'Median/MAD z>3': MedianMADDetector(),
         'Fixed 3 %': FixedThresholdDetector(margin=0.03),
         'Fixed 5 %': FixedThresholdDetector(margin=0.05),
@@ -176,14 +198,42 @@ def calibrate_router(data, cfg):
         mx.append(float(np.maximum(Sp, Sn).max()))
     th_cusum = float(margin * max(max(mx), 1e-9))
 
+    # longest honest excursion above the CUSUM threshold, fault-free, both in
+    # the calibration window and over the whole horizon
+    longest_win = longest_full = 0
+    for seed in SEEDS:
+        sc = build_scenario(data, None, seed)
+        T = sc['T']
+        W = int(frac * T)
+        deg = message_freshness(sc, cfg['detector']['router'].get(
+            'comms_max_age_steps', 2))
+        _, cus = router_stats(sc, ci_alpha=a, ci_mad_floor=floor,
+                              cusum_slack=slack, eta=eta, q_nom=q,
+                              deadband=db, degraded=deg)
+        raw = cus > th_cusum
+        acc = np.zeros(N, dtype=int)
+        for t in range(T):
+            acc = np.where(raw[t], acc + 1, 0)
+            m = int(acc.max())
+            if t < W:
+                longest_win = max(longest_win, m)
+            longest_full = max(longest_full, m)
+    p_cal = max(1, int(np.ceil(margin * longest_win)))
+
     out = dict(threshold_current_consistency=th_ci, threshold_cusum=th_cusum,
                cusum_slack=slack,
+               persistence_from_calibration=p_cal,
+               honest_longest_excursion_window=int(longest_win),
+               honest_longest_excursion_full_horizon=int(longest_full),
                honest_pooled_abs_residual_p999=float(np.percentile(r_pool, pct)),
                honest_pooled_ewma_ci_p999=float(np.percentile(ci_pool, pct)),
                honest_max_cusum_in_window=float(max(mx)),
                honest_max_ewma_ci_in_window=float(ci_pool.max()))
     print(f"  router calibration: th_ci={th_ci:.3f}  th_cusum={th_cusum:.3e}  "
           f"slack={slack:.3e}")
+    print(f"  honest CUSUM excursions above threshold: longest {longest_win} steps "
+          f"in the calibration window, {longest_full} over the full horizon "
+          f"-> P from calibration = {p_cal}")
     return out
 
 
@@ -207,9 +257,91 @@ def detector_kwargs(cal, cfg):
 
 
 # ======================================================================
+# E12 -- CUSUM persistence sweep and configuration selection (iteration 1)
+# ======================================================================
+# Selection criterion, declared BEFORE looking at any outcome:
+#   (hard)  false-positive rate exactly 0 on the fault-free control AND
+#           zero quarantines on the eight classes that must not be quarantined
+#   (score) among the configurations that pass, the highest mean probability of
+#           quarantining the target across the eight node-fault classes.
+# If none passes, the iteration-0 configuration stands.
+P_GRID = [1, 2, 30, 520]
+
+
+def _passes(res):
+    if res['none']['fpr_steps']['mean'] > 0:
+        return False
+    if res['none']['p_target_quarantined']['mean'] > 0:
+        return False
+    for c in MUST_NOT_QUARANTINE:
+        if res[c]['p_target_quarantined']['mean'] > 0:
+            return False
+        if res[c]['fpr_steps']['mean'] > 0:
+            return False
+    return True
+
+
+def _score(res):
+    return float(np.mean([res[c]['p_target_quarantined']['mean']
+                          for c in NODE_CLASSES]))
+
+
+def exp12_persistence(data, kw):
+    print()
+    print("=" * 72)
+    print("E12 CUSUM persistence sweep + configuration selection (iteration 1)")
+    print("=" * 72)
+    variants = ([('router-first', True, P) for P in P_GRID]
+                + [('gap-first (v3)', False, P) for P in (1, 520)])
+    out = {'grid': P_GRID, 'criterion':
+           'FPR==0 on the control and zero quarantines on the eight '
+           'must-not-quarantine classes; then max mean P(quarantine) over the '
+           'eight node-fault classes', 'variants': {}}
+    for label, rfirst, P in variants:
+        key = f'{label} P={P}'
+        per = {}
+        for name in ORDER + ['none']:
+            cls = None if name == 'none' else name
+            lst = []
+            for seed in SEEDS:
+                sc = build_scenario(data, cls, seed)
+                if cls is None:
+                    sc['targets'] = [TARGET]
+                det = ABRDetector(router=True, router_first=rfirst,
+                                  cusum_persistence=P, **kw)
+                lst.append(evaluate(det.run(sc), sc))
+            per[name] = {k: agg([d[k] for d in lst]) for k in lst[0]}
+        ok = _passes(per)
+        sc_ = _score(per)
+        out['variants'][key] = {'per_class': per, 'passes_criterion': bool(ok),
+                                'node_fault_score': sc_,
+                                'router_first': rfirst, 'persistence': P}
+        wrong = float(np.mean([per[c]['p_target_quarantined']['mean']
+                               for c in MUST_NOT_QUARANTINE]))
+        print(f"  {key:24s} passes={str(ok):5s} node-fault P(quar)={sc_:.3f} "
+              f"wrong-quarantine={wrong:.3f} "
+              f"ctrlFPR={per['none']['fpr_steps']['mean']:.4f} "
+              f"| N6={per['N6_collusion']['p_target_quarantined']['mean']:.2f} "
+              f"G3={per['G3_spikes']['p_target_quarantined']['mean']:.2f} "
+              f"N5={per['N5_firmware_bias']['p_target_quarantined']['mean']:.2f}")
+    passing = {k: v for k, v in out['variants'].items() if v['passes_criterion']}
+    if passing:
+        best = max(passing, key=lambda k: passing[k]['node_fault_score'])
+    else:
+        best = 'gap-first (v3) P=1'
+        print("  no configuration passes the hard constraint; "
+              "the iteration-0 configuration stands")
+    out['selected'] = best
+    out['selected_router_first'] = out['variants'][best]['router_first']
+    out['selected_persistence'] = out['variants'][best]['persistence']
+    print(f"  SELECTED: {best}")
+    return out
+
+
+# ======================================================================
 # E7 -- fault-class discrimination matrix
 # ======================================================================
-def exp7(data, kw):
+def exp7(data, kw, persist=1, router_first=False):
     print("\n" + "=" * 72)
     print("E7  Fault-class discrimination matrix (R1.1 / R2)")
     print("=" * 72)
@@ -221,7 +353,11 @@ def exp7(data, kw):
             sc = build_scenario(data, cls, seed)
             if cls is None:
                 sc['targets'] = [TARGET]        # score the same node
-            for dname, det in detector_bank(kw).items():
+            bank = detector_bank(kw, persist=persist)
+            if router_first:
+                bank['ABR-full'] = ABRDetector(router=True, router_first=True,
+                                               cusum_persistence=persist, **kw)
+            for dname, det in bank.items():
                 m = evaluate(det.run(sc), sc)
                 per.setdefault(dname, []).append(m)
         out[name] = {}
@@ -249,7 +385,7 @@ def exp7(data, kw):
 # ======================================================================
 # E8 -- honest-dispersion sweep
 # ======================================================================
-def exp8(data, kw):
+def exp8(data, kw, persist=1, router_first=False):
     print("\n" + "=" * 72)
     print("E8  Honest-dispersion sweep (R1.2)")
     print("=" * 72)
@@ -271,7 +407,10 @@ def exp8(data, kw):
             per = {}
             for seed in SEEDS:
                 sc = build_scenario(data, cls, seed, lam=lam)
-                bank = detector_bank(kw, full=False)
+                bank = detector_bank(kw, full=False, persist=persist)
+                if router_first:
+                    bank['ABR-full'] = ABRDetector(router=True, router_first=True,
+                                                   cusum_persistence=persist, **kw)
                 for dname in dets:
                     per.setdefault(dname, []).append(evaluate(bank[dname].run(sc), sc))
             for dname, lst in per.items():
@@ -287,7 +426,7 @@ def exp8(data, kw):
 # ======================================================================
 # E9 -- fault magnitude vs honest spread
 # ======================================================================
-def exp9(data, kw):
+def exp9(data, kw, persist=1, router_first=False):
     print("\n" + "=" * 72)
     print("E9  Fault magnitude vs honest spread (R1.2)")
     print("=" * 72)
@@ -305,7 +444,10 @@ def exp9(data, kw):
         for seed in SEEDS:
             sc = build_scenario(data, 'N5_firmware_bias', seed,
                                 msg_override={'bias': bias})
-            bank = detector_bank(kw, full=False)
+            bank = detector_bank(kw, full=False, persist=persist)
+            if router_first:
+                bank['ABR-full'] = ABRDetector(router=True, router_first=True,
+                                               cusum_persistence=persist, **kw)
             for dname in ('ABR-full', 'Fixed 3 %', 'Median/MAD z>3'):
                 per.setdefault(dname, []).append(evaluate(bank[dname].run(sc), sc))
         out['N5_bias'][str(bias)] = {
@@ -321,7 +463,10 @@ def exp9(data, kw):
         for seed in SEEDS:
             sc = build_scenario(data, 'N1_current_offset', seed,
                                 sig_override={'amp_A': amp})
-            bank = detector_bank(kw, full=False)
+            bank = detector_bank(kw, full=False, persist=persist)
+            if router_first:
+                bank['ABR-full'] = ABRDetector(router=True, router_first=True,
+                                               cusum_persistence=persist, **kw)
             for dname in ('ABR-full', 'Fixed 3 %', 'Median/MAD z>3'):
                 per.setdefault(dname, []).append(evaluate(bank[dname].run(sc), sc))
         out['N1_current'][str(amp)] = {
@@ -362,6 +507,73 @@ def exp10(data, df):
         invOCV_Vmax_where_SOC_below_015=float(inv_ocv(V_max[soc < 0.15]).mean()),
         SOC_mean_where_SOC_below_015=float(soc[soc < 0.15].mean()),
         horizon_hours=float(dt.sum() / 3600.0), n_samples=int(len(soc)))
+    # --- iteration 1: segment-wise capacity consistency -------------------
+    # Comparing NET charge throughput with the NET SOC change over 70 days is
+    # not a valid consistency test, because the BMS re-anchors its counter at
+    # every full charge.  The test is redone between re-anchoring events: the
+    # series is cut wherever SOC_bms jumps (|dSOC| > 2 points in one poll, or
+    # SOC_bms >= 95 %) and wherever the log has a gap, and within each segment
+    # dSOC_bms is regressed on the charge integral.
+    jump = np.abs(np.diff(soc, prepend=soc[0])) > 0.02
+    full = soc >= 0.95
+    gap = dt >= 300.0
+    cut = jump | full | gap
+    seg_id = np.cumsum(cut)
+    ah = np.cumsum(I * dt) / 3600.0
+    segs = []
+    for sid in np.unique(seg_id):
+        m = seg_id == sid
+        idx = np.flatnonzero(m)
+        if idx.size < 20:
+            continue
+        d_soc = soc[idx[-1]] - soc[idx[0]]
+        d_ah = ah[idx[-1]] - ah[idx[0]]
+        if abs(d_ah) < 5.0:
+            continue
+        segs.append((d_soc, d_ah, idx.size))
+    seg_fit = {'n_segments_usable': len(segs)}
+    if segs:
+        y = np.array([a for a, _, _ in segs])
+        for q_name, q_val in (('280Ah_cell', 280.0), ('4480Ah_group', 4480.0)):
+            x = np.array([b for _, b, _ in segs]) / q_val
+            beta = float(np.sum(x * y) / np.sum(x * x))
+            resid = y - beta * x
+            ss_tot = float(np.sum((y - y.mean()) ** 2))
+            r2 = float(1.0 - np.sum(resid ** 2) / ss_tot) if ss_tot > 0 else float('nan')
+            seg_fit[q_name] = {'slope_beta': beta,
+                               'implied_effective_capacity_Ah': float(q_val / beta)
+                               if beta != 0 else None,
+                               'r2': r2}
+        seg_fit['pearson_r_dSOC_vs_dAh'] = float(
+            np.corrcoef(y, np.array([b for _, b, _ in segs]))[0, 1])
+        seg_fit['total_segment_samples'] = int(sum(c for _, _, c in segs))
+
+    # --- iteration 1: how inconsistent is the voltage channel, and where ----
+    v_mid = 0.5 * (V_min + V_max)
+    err = np.abs(inv_ocv(v_mid) - soc)
+    rest_m = np.abs(I) <= 5.0
+    t_h = np.cumsum(dt) / 3600.0
+    day = np.floor(t_h / 24.0).astype(int)
+    bad = err > 0.20
+    per_day = {}
+    for dd in np.unique(day):
+        m = day == dd
+        per_day[int(dd)] = float(bad[m].mean())
+    days_sorted = sorted(per_day)
+    half = len(days_sorted) // 2
+    ocv_incons = {
+        'frac_samples_err_gt_20pts_all': float(bad.mean()),
+        'frac_samples_err_gt_20pts_at_rest': float(bad[rest_m].mean()),
+        'median_abs_err_all': float(np.median(err)),
+        'median_abs_err_at_rest': float(np.median(err[rest_m])),
+        'frac_in_first_half_of_coverage': float(
+            np.mean([per_day[d] for d in days_sorted[:half]])) if half else None,
+        'frac_in_second_half_of_coverage': float(
+            np.mean([per_day[d] for d in days_sorted[half:]])) if half else None,
+        'per_day_fraction': per_day,
+        'n_days_of_coverage': len(days_sorted),
+    }
+
     sim = {}
     for lam in [0.25, 1.0, 4.0]:
         dv, ds_, tv = [], [], []
@@ -385,13 +597,26 @@ def exp10(data, df):
           f"{cons['corr_invOCV_Vpack_vs_SOC']:+.3f}; net throughput "
           f"{cons['net_charge_throughput_Ah']:.0f} Ah vs net SOC change "
           f"{cons['net_SOC_change']:+.3f}")
-    return dict(measured_envelope=meas, dataset_consistency=cons, simulated=sim)
+    print(f"  segment-wise capacity fit ({seg_fit['n_segments_usable']} segments): "
+          + (", ".join(f"Q={k}: beta={v['slope_beta']:.3f} R2={v['r2']:.3f} "
+                       f"Qeff={v['implied_effective_capacity_Ah']:.0f} Ah"
+                       for k, v in seg_fit.items()
+                       if isinstance(v, dict) and 'slope_beta' in v)
+             if seg_fit['n_segments_usable'] else "no usable segment"))
+    print(f"  OCV inconsistency: |invOCV(V_mid)-SOC| > 20 pts in "
+          f"{ocv_incons['frac_samples_err_gt_20pts_all']*100:.1f} % of samples "
+          f"({ocv_incons['frac_samples_err_gt_20pts_at_rest']*100:.1f} % at rest); "
+          f"first half of coverage {ocv_incons['frac_in_first_half_of_coverage']*100:.1f} % "
+          f"vs second half {ocv_incons['frac_in_second_half_of_coverage']*100:.1f} %")
+    return dict(measured_envelope=meas, dataset_consistency=cons, simulated=sim,
+                segmentwise_capacity_fit=seg_fit,
+                ocv_inconsistency=ocv_incons)
 
 
 # ======================================================================
 # E11 -- voltage-anchor sensitivity (replaces Table 11)
 # ======================================================================
-def exp11(data, kw):
+def exp11(data, kw, persist=1, router_first=False):
     print("\n" + "=" * 72)
     print("E11 Voltage-anchor sensitivity -- replaces Table 11")
     print("=" * 72)
@@ -404,7 +629,9 @@ def exp11(data, kw):
                 sc = build_scenario(data, cls, seed, anchor=anchor)
                 if cls is None:
                     sc['targets'] = [TARGET]
-                per.append(evaluate(ABRDetector(router=True, **kw).run(sc), sc))
+                per.append(evaluate(ABRDetector(
+                    router=True, router_first=router_first,
+                    cusum_persistence=persist, **kw).run(sc), sc))
                 disp.append(honest_dispersion(sc['s_hat']))
             key = 'none' if cls is None else cls
             out[anchor][key] = {k: agg([d[k] for d in per]) for k in per[0]}
@@ -425,15 +652,21 @@ ABL_CLASSES = ['N5_firmware_bias', 'N8_random_report',
                'N7_stealth_drift', 'N6_collusion']
 
 
-def exp1p(data, kw):
+def exp1p(data, kw, persist=1, router_first=False):
     print("\n" + "=" * 72)
     print("E1' Detector ablation on the v3 signal model")
     print("=" * 72)
     variants = {
         'EWMA trust only': dict(router=False, gap_quarantine=False, trust_grading=True),
         'Gap only (no trust grading)': dict(router=False, gap_quarantine=True, trust_grading=False),
-        'EWMA + gap (round-1 detector)': dict(router=False, gap_quarantine=True, trust_grading=True),
-        'EWMA + gap + router (v3)': dict(router=True, gap_quarantine=True, trust_grading=True),
+        'EWMA + gap (round-1 detector)': dict(router=False, gap_quarantine=True,
+                                              trust_grading=True, comms_state=False),
+        'EWMA + gap + message freshness': dict(router=False, gap_quarantine=True,
+                                               trust_grading=True),
+        'EWMA + gap + router (v3)': dict(router=True, gap_quarantine=True,
+                                         trust_grading=True,
+                                         router_first=router_first,
+                                         cusum_persistence=persist),
     }
     out = {}
     for cls in ABL_CLASSES:
@@ -466,7 +699,7 @@ def exp1p(data, kw):
     return out
 
 
-def exp2p(data, kw):
+def exp2p(data, kw, persist=1, router_first=False):
     print("\n" + "=" * 72)
     print("E2' Gap-threshold sweep on the v3 signal model")
     print("=" * 72)
@@ -481,7 +714,9 @@ def exp2p(data, kw):
             for g in gaps:
                 k2 = dict(kw)
                 k2['gap_threshold'] = g
-                m = evaluate(ABRDetector(router=True, **k2).run(sc), sc)
+                m = evaluate(ABRDetector(
+                    router=True, router_first=router_first,
+                    cusum_persistence=persist, **k2).run(sc), sc)
                 acc[g]['rmse'].append(m['rmse_consensus'])
                 acc[g]['fpr'].append(m['fpr_steps'])
                 if node_fault:
@@ -500,7 +735,7 @@ def exp2p(data, kw):
     return out
 
 
-def exp6p(data, kw):
+def exp6p(data, kw, persist=1, router_first=False):
     print("\n" + "=" * 72)
     print("E6' Centralised vs distributed on the v3 signal model")
     print("=" * 72)
@@ -510,7 +745,9 @@ def exp6p(data, kw):
         for seed in SEEDS:
             sc = build_scenario(data, cls, seed)
             c = evaluate(CentralisedMean(n=N, f_max=5).run(sc), sc)
-            d = evaluate(ABRDetector(router=True, **kw).run(sc), sc)
+            d = evaluate(ABRDetector(
+                router=True, router_first=router_first,
+                cusum_persistence=persist, **kw).run(sc), sc)
             cen.append(c['rmse_consensus']); dis.append(d['rmse_consensus'])
             cenm.append(c['mae_consensus']); dism.append(d['mae_consensus'])
         out[cls] = {'Centralised mean': {'rmse': agg(cen), 'mae': agg(cenm)},
@@ -540,19 +777,28 @@ def main():
     cfg['detector']['router'].update(
         threshold_current_consistency=cal['threshold_current_consistency'],
         threshold_cusum=cal['threshold_cusum'],
-        cusum_slack=cal['cusum_slack'])
-    CONFIG.write_text(json.dumps(cfg, indent=2), encoding='utf-8')
+        cusum_slack=cal['cusum_slack'],
+        persistence_from_calibration=cal['persistence_from_calibration'],
+        honest_longest_excursion_window=cal['honest_longest_excursion_window'],
+        honest_longest_excursion_full_horizon=cal[
+            'honest_longest_excursion_full_horizon'])
     kw = detector_kwargs(cal, cfg)
 
     R = {'_meta': {}, 'router_calibration': cal}
-    R['E7_fault_class_matrix'] = exp7(data, kw)
-    R['E8_dispersion_sweep'] = exp8(data, kw)
-    R['E9_magnitude_vs_spread'] = exp9(data, kw)
+    R['E12_persistence_selection'] = exp12_persistence(data, kw)
+    P = R['E12_persistence_selection']['selected_persistence']
+    RF = R['E12_persistence_selection']['selected_router_first']
+    print()
+    print(f"Running the rest with the selected configuration: "
+          f"router_first={RF}, persistence P={P}")
+    R['E7_fault_class_matrix'] = exp7(data, kw, P, RF)
+    R['E8_dispersion_sweep'] = exp8(data, kw, P, RF)
+    R['E9_magnitude_vs_spread'] = exp9(data, kw, P, RF)
     R['E10_calibration'] = exp10(data, df)
-    R['E11_voltage_anchor'] = exp11(data, kw)
-    R['E1p_ablation'] = exp1p(data, kw)
-    R['E2p_gap_sweep'] = exp2p(data, kw)
-    R['E6p_centralised'] = exp6p(data, kw)
+    R['E11_voltage_anchor'] = exp11(data, kw, P, RF)
+    R['E1p_ablation'] = exp1p(data, kw, P, RF)
+    R['E2p_gap_sweep'] = exp2p(data, kw, P, RF)
+    R['E6p_centralised'] = exp6p(data, kw, P, RF)
 
     R['_meta'] = dict(
         seeds=SEEDS, subsample=SUBSAMPLE, n_modules=N,
@@ -562,11 +808,17 @@ def main():
         current_sign_convention='positive = charging (verified on the data)',
         detector_kwargs={k: (v if not isinstance(v, np.floating) else float(v))
                          for k, v in kw.items()},
+        iteration=1,
+        selected_persistence=P, selected_router_first=bool(RF),
+        selection_criterion=R['E12_persistence_selection']['criterion'],
         timestamp=time.strftime('%Y-%m-%dT%H:%M:%S'),
         runtime_seconds=None)
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     R['_meta']['runtime_seconds'] = round(time.time() - t0, 1)
+    cfg['detector']['router'].update(selected_persistence=int(P),
+                                     selected_router_first=bool(RF))
+    CONFIG.write_text(json.dumps(cfg, indent=2), encoding='utf-8')
     (OUT_DIR / "revision2_results.json").write_text(
         json.dumps(R, indent=2, default=str), encoding='utf-8')
 

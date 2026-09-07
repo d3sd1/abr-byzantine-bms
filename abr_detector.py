@@ -46,13 +46,35 @@ import numpy as np
 
 TRUSTED, SUSPECT, QUARANTINED, BATTERY = 0, 1, 2, 3
 STATE_NAMES = ['trusted', 'suspect', 'quarantined', 'battery-anomaly']
+COMMS_DEGRADED = 'comms-degraded'
+
+
+def message_freshness(sc, max_age=2):
+    """Which held messages the RS485 master knows to be stale.
+
+    Derived only from the sequence number the master already reads off every
+    frame: a reply is fresh if its sequence number advanced since the previous
+    poll and its age does not exceed `max_age` poll cycles.  No extra sensor
+    and no extra traffic is implied -- any bus master has exactly this.
+    """
+    T, n = sc['s_rep'].shape
+    src = sc.get('src')
+    if src is None:                      # fall back to the legacy flag
+        deg = sc['stale'].copy()
+        deg[0] = False
+        return deg
+    advanced = np.diff(src, axis=0, prepend=src[:1] - 1) > 0
+    age = np.arange(T)[:, None] - src
+    deg = (~advanced) | (age > max_age)
+    deg[0] = False
+    return deg
 
 
 # ----------------------------------------------------------------------
 # Router statistics -- state-independent, so computed once, vectorised
 # ----------------------------------------------------------------------
 def router_stats(sc, *, ci_alpha=0.05, ci_mad_floor=0.20, cusum_slack=9.7e-4,
-                 eta=0.995, q_nom=4480.0, deadband=2.0):
+                 eta=0.995, q_nom=4480.0, deadband=2.0, degraded=None):
     """Return (ewma_ci, cusum) arrays of shape (T,n).
 
     Neither statistic depends on the detector's quarantine state, so both can
@@ -68,7 +90,8 @@ def router_stats(sc, *, ci_alpha=0.05, ci_mad_floor=0.20, cusum_slack=9.7e-4,
     # whole gap, which the aggregator cannot attribute to one step, so it is
     # excluded from the model-based tests along with the stale samples
     # themselves.  Without this a burst of packet loss looks like a node fault.
-    blind = stale | np.roll(stale, 1, axis=0)
+    deg = stale if degraded is None else degraded
+    blind = deg | np.roll(deg, 1, axis=0)
     blind[0] = True
 
     # (i) shared-current consistency
@@ -115,6 +138,7 @@ class ABRDetector:
                  router_first=False,
                  ci_alpha=0.05, ci_mad_floor=0.20,
                  th_ci=3.85, th_cusum=6.6e-5, cusum_slack=9.7e-4,
+                 cusum_persistence=1, comms_state=True, comms_max_age=2,
                  eta=0.995, q_nom=4480.0, deadband=2.0, latch=True):
         self.n, self.f = n, f_max
         self.mad_floor = mad_floor
@@ -128,22 +152,42 @@ class ABRDetector:
         self.th_ci, self.th_cusum, self.slack = th_ci, th_cusum, cusum_slack
         self.eta, self.q, self.db, self.latch = eta, q_nom, deadband, latch
         self.router_first = router_first
+        self.persist = max(int(cusum_persistence), 1)
+        self.comms_state, self.comms_max_age = comms_state, int(comms_max_age)
         if not router:
             self.name = 'ABR-no-router'
         elif router_first:
             self.name = 'ABR-router-first'
+        if router and self.persist > 1:
+            self.name += f' (P={self.persist})'
 
     # ------------------------------------------------------------------
     def run(self, sc):
         n, f = self.n, self.f
         s_rep = sc['s_rep']
         T = s_rep.shape[0]
+        degraded = (message_freshness(sc, self.comms_max_age)
+                    if self.comms_state else np.zeros(s_rep.shape, bool))
         ewma_ci, cusum = router_stats(
             sc, ci_alpha=self.ci_alpha, ci_mad_floor=self.ci_floor,
             cusum_slack=self.slack, eta=self.eta, q_nom=self.q,
-            deadband=self.db)
+            deadband=self.db, degraded=degraded if self.comms_state else None)
         bad_i = ewma_ci > self.th_ci
-        bad_c = cusum > self.th_cusum
+        raw_c = cusum > self.th_cusum
+        if self.persist > 1:
+            # A single-sample spike puts +d then -d into the residual, so the
+            # CUSUM returns to baseline; a step change (firmware bias,
+            # collusion) keeps it above the threshold.  Requiring the excursion
+            # to last P consecutive polls therefore separates spike from step
+            # without looking at the fault taxonomy.
+            run = np.zeros(raw_c.shape, dtype=np.int32)
+            acc = np.zeros(raw_c.shape[1], dtype=np.int32)
+            for t in range(raw_c.shape[0]):
+                acc = np.where(raw_c[t], acc + 1, 0)
+                run[t] = acc
+            bad_c = run >= self.persist
+        else:
+            bad_c = raw_c
         if self.latch:
             bad_i = np.maximum.accumulate(bad_i, axis=0)
             bad_c = np.maximum.accumulate(bad_c, axis=0)
@@ -155,6 +199,7 @@ class ABRDetector:
         excl = np.zeros((T, n), bool)
         batt_hist = np.zeros((T, n), bool)
         ever_suspect = np.zeros(n, bool)
+        ever_comms = np.zeros(n, bool)
         first_flag = np.full(n, -1)
         a_up, a_dn, cap = self.a_up, self.a_dn, self.cap
         gl, gh, gb, kk, x0 = self.gl, self.gh, self.gb, self.k, self.x0
@@ -178,11 +223,16 @@ class ABRDetector:
             for k in range(zseg.shape[0]):
                 tt = t + k
                 z = zseg[k]
+                dg = degraded[tt]
                 a = np.where(z >= ew, a_up, a_dn)
                 ew_new = (1.0 - a) * ew + a * z
                 np.minimum(ew_new, cap, out=ew_new)
-                ew = np.where(act, ew_new, ew)
+                # a node the master knows to be stale accrues no evidence:
+                # its EWMA is frozen and its report carries no weight, but its
+                # trust is untouched and it recovers as soon as frames arrive
+                ew = np.where(act & ~dg, ew_new, ew)
                 ever_suspect |= ew > sus_z
+                ever_comms |= dg
 
                 if grading:
                     trust = gl + (gh - gl) / (1.0 + np.exp(kk * (ew - x0)))
@@ -198,7 +248,7 @@ class ABRDetector:
                 # that never crossed the gap at all (the collusion case).
                 pool = (~quar) if self.router_first else batt
                 if use_router and pool.any() and nq < f:
-                    esc = np.flatnonzero(pool & (bad_i[tt] | bad_c[tt]))
+                    esc = np.flatnonzero(pool & ~dg & (bad_i[tt] | bad_c[tt]))
                     for node in esc:
                         if nq < f and not quar[node]:
                             batt[node] = False
@@ -210,7 +260,7 @@ class ABRDetector:
                     if restart:
                         excl[tt] = quar
                         batt_hist[tt] = batt
-                        w = np.where(quar, 0.0, trust)
+                        w = np.where(quar | dg, 0.0, trust)
                         ws = w.sum()
                         cons[tt] = (np.median(s_rep[tt]) if ws < 1e-10
                                     else float(np.dot(w / ws, s_rep[tt])))
@@ -219,7 +269,7 @@ class ABRDetector:
 
                 # gap-based quarantine (pre-check avoids a sort at every step)
                 if do_quar and nq < f and ew.max() > min_ew:
-                    cand = np.flatnonzero(act & ~batt)
+                    cand = np.flatnonzero(act & ~batt & ~dg)
                     if len(cand) > f + 1:
                         ewc = ew[cand]
                         order = np.argsort(-ewc)
@@ -247,7 +297,7 @@ class ABRDetector:
                                     if first_flag[node] < 0:
                                         first_flag[node] = tt
 
-                w = np.where(quar, 0.0, trust)
+                w = np.where(quar | dg, 0.0, trust)
                 ws = w.sum()
                 cons[tt] = (np.median(s_rep[tt]) if ws < 1e-10
                             else float(np.dot(w / ws, s_rep[tt])))
@@ -270,7 +320,8 @@ class ABRDetector:
         return dict(cons=cons, excl=excl, worst=worst, first_ex=first_ex,
                     quarantined=quar.copy(), battery=batt.copy(),
                     batt_hist=batt_hist, first_flag=first_flag,
-                    ewma_ci=ewma_ci, cusum=cusum, bad_i=bad_i, bad_c=bad_c)
+                    ewma_ci=ewma_ci, cusum=cusum, bad_i=bad_i, bad_c=bad_c,
+                    degraded=degraded, ever_comms=ever_comms)
 
 
 # ======================================================================

@@ -230,7 +230,16 @@
       "threshold_current_consistency": 4.791456886480002,
       "threshold_cusum": 3.841373697932582e-05,
       "cusum_slack": 0.0009740885416666676,
-      "calibration_note": "thresholds are computed by revision2_experiments.py from FAULT-FREE runs on the first 10 % of the horizon (5 seeds, lambda=1) and written back into this file; they are never tuned by looking at the fault classes"
+      "calibration_note": "thresholds are computed by revision2_experiments.py from FAULT-FREE runs on the first 10 % of the horizon (5 seeds, lambda=1) and written back into this file; they are never tuned by looking at the fault classes",
+      "comms_max_age_steps": 2,
+      "comms_degraded_state": true,
+      "comms_note": "A held reply is stale when its sequence number did not advance since the previous poll or its age exceeds comms_max_age_steps. A stale node is marked comms-degraded: excluded from that step's consensus, EWMA frozen, no router evidence accrued, trust untouched, automatic recovery. This is information every RS485 bus master already reads off the frame; no extra sensor is implied.",
+      "cusum_persistence_note": "A CUSUM excursion counts only if it lasts P consecutive polls. P is calibrated as 1.5x the longest honest excursion above the threshold in the fault-free calibration window; see persistence_from_calibration. The value actually used is chosen over the declared grid P_GRID by the pre-declared selection criterion in E12.",
+      "persistence_from_calibration": 1,
+      "honest_longest_excursion_window": 0,
+      "honest_longest_excursion_full_horizon": 0,
+      "selected_persistence": 1,
+      "selected_router_first": false
     }
   },
   "baselines": [
@@ -250,7 +259,8 @@
     "E11": "voltage-anchor sensitivity (replaces Table 11)",
     "E1p": "detector ablation (EWMA / gap / router) on the v3 signal model",
     "E2p": "gap-threshold sweep on the v3 signal model",
-    "E6p": "centralised vs distributed on the v3 signal model"
+    "E6p": "centralised vs distributed on the v3 signal model",
+    "E12": "CUSUM persistence sweep and configuration selection (iteration 1); declared criterion: FPR==0 on the fault-free control and zero quarantines on the eight must-not-quarantine classes, then max mean P(quarantine) over the eight node-fault classes"
   },
   "evaluation": {
     "metrics": [
@@ -263,5 +273,6 @@
     ],
     "ground_truth_consensus": "mean over the 16 groups of the true module SOC",
     "aggregation": "mean +/- std over the 5 seeds, per-seed values also stored"
-  }
+  },
+  "tuning_iteration": 1
 }

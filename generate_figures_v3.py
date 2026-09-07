@@ -81,42 +81,42 @@ def load():
 def fig_r6(R):
     e7 = R['E7_fault_class_matrix']
     classes = [c for c in SHORT if c in e7]
-    cols = ['quarantined', 'battery-anomaly', 'suspect', 'trusted']
+    cols = ['quarantined', 'battery-\nanomaly', 'suspect', 'trusted',
+            'comms-\ndegraded']
     keys = ['p_target_quarantined', 'p_target_battery',
-            'p_target_suspect', 'p_target_trusted']
+            'p_target_suspect', 'p_target_trusted', 'p_target_comms_degraded']
+    R1 = 'ABR-round-1 (no router, no freshness)'
 
     def mat(det):
         return np.array([[e7[c][det][k]['mean'] for k in keys] for c in classes])
 
-    A = mat('ABR-full')
-    B = mat('ABR-no-router')
     C = np.array([[e7[c]['Fixed 3 %']['tpr_steps']['mean'],
                    e7[c]['Fixed 3 %']['fpr_steps']['mean'],
                    e7[c]['Median/MAD z>3']['tpr_steps']['mean'],
                    e7[c]['Median/MAD z>3']['fpr_steps']['mean']]
                   for c in classes])
 
-    fig, axes = plt.subplots(1, 3, figsize=(7.2, 5.1),
-                             gridspec_kw={'width_ratios': [1, 1, 1]})
+    fig, axes = plt.subplots(1, 4, figsize=(7.4, 5.3))
     panels = [
-        (A, cols, '(a) ABR with router (v3)'),
-        (B, cols, '(b) ABR without router\n(round-1 detector)'),
+        (mat(R1), cols, '(a) round-1 detector\n(no router, no freshness)'),
+        (mat('ABR-no-router'), cols, '(b) + message freshness\n(no router)'),
+        (mat('ABR-full'), cols, '(c) + physical router\n= v3 final'),
         (C, ['fixed 3 %\ntarget', 'fixed 3 %\nhealthy',
              'Med/MAD\ntarget', 'Med/MAD\nhealthy'],
-         '(c) threshold baselines\n(fraction of steps excluded)'),
+         '(d) threshold baselines\n(fraction of steps excluded)'),
     ]
     for ax, (M, cl, ttl) in zip(axes, panels):
         im = ax.imshow(M, cmap='YlGnBu', vmin=0, vmax=1, aspect='auto')
         ax.set_xticks(range(len(cl)))
-        ax.set_xticklabels(cl, rotation=90)
+        ax.set_xticklabels(cl, rotation=90, fontsize=6.5)
         ax.set_yticks(range(len(classes)))
-        ax.set_title(ttl, fontsize=9)
+        ax.set_title(ttl, fontsize=8)
         for i in range(M.shape[0]):
             for j in range(M.shape[1]):
                 v = M[i, j]
                 if v >= 0.005:
                     ax.text(j, i, f'{v:.2f}', ha='center', va='center',
-                            fontsize=5.5, color='white' if v > 0.55 else 'black')
+                            fontsize=5.0, color='white' if v > 0.55 else 'black')
         ax.set_xticks(np.arange(-.5, M.shape[1], 1), minor=True)
         ax.set_yticks(np.arange(-.5, len(classes), 1), minor=True)
         ax.grid(which='minor', color='w', linewidth=0.6)
@@ -124,13 +124,12 @@ def fig_r6(R):
     axes[0].set_yticklabels([SHORT[c] for c in classes], fontsize=6.5)
     for ax in axes[1:]:
         ax.set_yticklabels([])
-    # family separators
     fam = [FAMILY[c] for c in classes]
     for ax in axes:
         for i in range(1, len(fam)):
             if fam[i] != fam[i - 1]:
                 ax.axhline(i - 0.5, color='k', lw=1.1)
-    fig.colorbar(im, ax=axes, fraction=0.026, pad=0.02,
+    fig.colorbar(im, ax=axes, fraction=0.020, pad=0.02,
                  label='probability / fraction of steps')
     fig.savefig(FIG / 'figR6_fault_class_matrix.pdf', bbox_inches='tight')
     plt.close(fig)
@@ -330,37 +329,41 @@ def fig_r9(R):
 def fig_r1v3(R):
     e1 = R['E1p_ablation']
     variants = ['EWMA trust only', 'Gap only (no trust grading)',
-                'EWMA + gap (round-1 detector)', 'EWMA + gap + router (v3)']
-    short = ['EWMA only', 'gap only', 'EWMA+gap\n(round 1)', 'EWMA+gap\n+router (v3)']
+                'EWMA + gap (round-1 detector)',
+                'EWMA + gap + message freshness',
+                'EWMA + gap + router (v3)']
+    short = ['EWMA only', 'gap only', 'EWMA+gap\n(round 1)',
+             '+ message\nfreshness', '+ router\n(v3 final)']
     node = [c for c in e1 if not c.startswith('_')]
     fp = e1['_false_positive_check']
     fpc = list(fp.keys())
-    cols = [CB['grey'], CB['orange'], CB['red'], CB['blue']]
-    fig, (a1, a2) = plt.subplots(1, 2, figsize=(7.2, 2.8))
-    xn = np.arange(len(node)); w = 0.2
+    cols = [CB['grey'], CB['orange'], CB['red'], CB['purple'], CB['blue']]
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(7.2, 3.2))
+    xn = np.arange(len(node)); w = 0.16
     for i, v in enumerate(variants):
         y = [e1[c][v]['tpr_steps']['mean'] * 100 for c in node]
         e = [e1[c][v]['tpr_steps']['std'] * 100 for c in node]
         a1.bar(xn + i * w, y, w, yerr=e, color=cols[i], capsize=1.5,
                label=short[i], alpha=0.92)
-    a1.set_xticks(xn + 1.5 * w)
+    a1.set_xticks(xn + 2.0 * w)
     a1.set_xticklabels([SHORT[c].split('(')[0].strip() for c in node],
                        rotation=18, ha='right', fontsize=6.5)
-    a1.set_ylabel('node fault excluded (% of steps)')
+    a1.set_ylabel('node fault excluded (% of steps)', fontsize=9)
     a1.set_title('(a) detection of true node faults', fontsize=9)
-    a1.set_ylim(0, 118)
+    a1.set_ylim(0, 105)
     a1.grid(alpha=0.3, axis='y')
-    a1.legend(fontsize=6, ncol=2, loc='upper center', framealpha=0.92)
+    a1.legend(fontsize=6, ncol=3, loc='upper center',
+              bbox_to_anchor=(0.5, -0.30), framealpha=0.92)
 
     xf = np.arange(len(fpc))
     for i, v in enumerate(variants):
         y = [fp[c][v]['p_target_quarantined']['mean'] * 100 for c in fpc]
         e = [fp[c][v]['p_target_quarantined']['std'] * 100 for c in fpc]
         a2.bar(xf + i * w, y, w, yerr=e, color=cols[i], capsize=1.5, alpha=0.92)
-    a2.set_xticks(xf + 1.5 * w)
+    a2.set_xticks(xf + 2.0 * w)
     a2.set_xticklabels([SHORT[c].split('(')[0].strip() for c in fpc],
                        rotation=18, ha='right', fontsize=6.5)
-    a2.set_ylabel('WRONGLY quarantined (% of seeds)')
+    a2.set_ylabel('wrongly quarantined (% of seeds)', fontsize=9)
     a2.set_title('(b) glitches and battery faults\n(any quarantine is an error)',
                  fontsize=9)
     a2.grid(alpha=0.3, axis='y')
