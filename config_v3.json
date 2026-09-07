@@ -1,0 +1,267 @@
+{
+  "experiment_name": "ABR distributed BMS fault detector - signal-level validation (v3)",
+  "paper_slug": "2026-abr-pinn-bms-byzantine",
+  "revision_round": 2,
+  "motivation": "Applied Energy APEN-D-26-09704R1 reject/resubmit. R1.1 (faults injected at report level, aging-vs-attack never tested), R1.2 (modules were near-copies), R2 (no evidence on internal short-circuit or cell imbalance), Table 11 (per-module detail did not contribute).",
+  "random_seeds": [
+    42,
+    123,
+    456,
+    789,
+    1024
+  ],
+  "dataset": {
+    "name": "El Tiemblo Solar+Storage LiFePO4 (16s16p), 70 days",
+    "path": "datasets/eltiemblo_solar_completo/848299_0_Hock_log_20250101-0000_to_20251231-2358.csv",
+    "raw_samples": 22524,
+    "subsample": 2,
+    "samples_used": 11262,
+    "dt_recomputed_after_subsampling": true,
+    "dt_clip_seconds": [
+      0.1,
+      600.0
+    ],
+    "current_sign_convention": "POSITIVE = CHARGING (verified: mean I = +175.7 A when the BMS SOC rises, -56.2 A when it falls; windowed regression of dSOC on integral(I dt) has positive slope). NOTE: run_evaluation.py (round 1) used the opposite convention."
+  },
+  "pack": {
+    "n_series_groups": 16,
+    "n_parallel_cells_per_group": 16,
+    "q_nom_cell_Ah": 280.0,
+    "q_nom_group_Ah": 4480.0,
+    "r0_cell_ohm": 0.0004,
+    "v_nom_cell_V": 3.2,
+    "ocv_poly_coeffs_ascending": [
+      2.8,
+      3.15,
+      -14.2,
+      34.8,
+      -43.5,
+      27.2,
+      -6.8
+    ]
+  },
+  "signal_model": {
+    "sigma_Q": 0.02,
+    "sigma_R0": 0.05,
+    "sigma_e0": 0.01,
+    "sigma_bias_V": 0.003,
+    "sigma_noise_V": 0.002,
+    "I_full_scale_A": 500.0,
+    "sigma_bias_I_fraction_FS": 0.002,
+    "sigma_noise_I_A": 0.5,
+    "temp_gradient_C_per_module": 0.15,
+    "sigma_noise_T_C": 0.2,
+    "capacity_drift_reset_soc": 0.95,
+    "voltage_anchor": "ocv",
+    "ocv_dispersion_floor_V": 0.001,
+    "dispersion_scale_lambda_default": 1.0,
+    "dispersion_scale_applies_to": [
+      "sigma_Q",
+      "sigma_bias_I_fraction_FS",
+      "sigma_e0"
+    ]
+  },
+  "local_estimator": {
+    "description": "Per-node Coulomb counter on the node's own measured current with the NOMINAL group capacity (the node does not know its real capacity), OCV re-anchoring only at the OCV knees and at rest, full-charge reset, current deadband. Mirrors JK-BMS firmware behaviour.",
+    "eta": 0.995,
+    "q_used_Ah": 4480.0,
+    "current_deadband_A": 1.0,
+    "ocv_correction_knee_low": 0.15,
+    "ocv_correction_knee_high": 0.85,
+    "ocv_correction_rest_current_A": 5.0,
+    "ocv_correction_gain": 0.01,
+    "full_charge_reset_V_cell": 3.55,
+    "full_charge_reset_tail_current_A": 5.0,
+    "full_charge_reset_soc_gate": 0.8,
+    "full_charge_reset_target_soc": 1.0,
+    "report_quantisation_soc": 0.001,
+    "report_quantisation_current_A": 0.1
+  },
+  "faults": {
+    "t_start_fraction": 0.25,
+    "single_target_node": 7,
+    "collusion_nodes": [
+      0,
+      3,
+      7,
+      11,
+      14
+    ],
+    "packet_loss_nodes": [
+      3,
+      7,
+      11
+    ],
+    "classes": {
+      "N1_current_offset": {
+        "family": "node",
+        "expected": "quarantine",
+        "amp_A": 5.0,
+        "sweep_A": [
+          2.0,
+          5.0,
+          10.0
+        ]
+      },
+      "N2_voltage_offset": {
+        "family": "node",
+        "expected": "quarantine",
+        "amp_V": 0.05
+      },
+      "N3_frozen_report": {
+        "family": "node",
+        "expected": "quarantine"
+      },
+      "N4_message_corrupt": {
+        "family": "node",
+        "expected": "quarantine",
+        "p_per_message": 0.05,
+        "persistent": true
+      },
+      "N5_firmware_bias": {
+        "family": "node",
+        "expected": "quarantine",
+        "bias": 0.05,
+        "sweep": [
+          0.01,
+          0.02,
+          0.03,
+          0.05,
+          0.1
+        ]
+      },
+      "N6_collusion": {
+        "family": "node",
+        "expected": "quarantine",
+        "bias": 0.03,
+        "n_nodes": 5
+      },
+      "N7_stealth_drift": {
+        "family": "node",
+        "expected": "quarantine",
+        "per_step": 0.0001,
+        "per_step_ramp": 1e-05
+      },
+      "N8_random_report": {
+        "family": "node",
+        "expected": "quarantine"
+      },
+      "G1_packet_loss": {
+        "family": "glitch",
+        "expected": "no-quarantine",
+        "loss_rate": 0.2,
+        "burst_min": 5,
+        "burst_max": 50,
+        "from_t0": true
+      },
+      "G2_delay": {
+        "family": "glitch",
+        "expected": "no-quarantine",
+        "delay_min": 5,
+        "delay_max": 30
+      },
+      "G3_spikes": {
+        "family": "glitch",
+        "expected": "no-quarantine",
+        "p_spike": 0.01,
+        "amp": 0.1
+      },
+      "B1_aging": {
+        "family": "battery",
+        "expected": "no-quarantine",
+        "capacity_loss": 0.15,
+        "r0_factor": 1.5,
+        "from_t0": true
+      },
+      "B2_imbalance": {
+        "family": "battery",
+        "expected": "no-quarantine",
+        "soc_offset": -0.08,
+        "from_t0": true
+      },
+      "B3_internal_short": {
+        "family": "battery",
+        "expected": "no-quarantine",
+        "r_isc_ohm": 33.0,
+        "dT_C": 0.5,
+        "note": "0.1 A leak = 0.054 %/day at the declared 4480 Ah group capacity"
+      },
+      "B3b_internal_short_severe": {
+        "family": "battery",
+        "expected": "no-quarantine",
+        "r_isc_ohm": 2.0625,
+        "dT_C": 0.5,
+        "note": "16-parallel-cell equivalent: 1.6 A leak = 0.86 %/day, matches the per-cell severity quoted in the review protocol"
+      },
+      "B4_thermal": {
+        "family": "battery",
+        "expected": "no-quarantine",
+        "dT_C": 5.0
+      }
+    }
+  },
+  "detector": {
+    "n_modules": 16,
+    "f_max": 5,
+    "mad_floor": 0.005,
+    "ewma_alpha_up": 0.1,
+    "ewma_alpha_down": 0.3,
+    "ewma_cap": 25.0,
+    "trust_sigmoid_k": 1.5,
+    "trust_sigmoid_x0": 6.0,
+    "trust_high": 0.8,
+    "trust_low": 0.4,
+    "trust_battery_anomaly": 0.1,
+    "gap_threshold": 3.0,
+    "min_ewma_quarantine": 5.0,
+    "suspect_z": 3.0,
+    "router": {
+      "enabled_in_full_variant": true,
+      "current_consistency_ewma_alpha": 0.05,
+      "current_mad_floor_A": 0.2,
+      "cusum_eta": 0.995,
+      "cusum_q_Ah": 4480.0,
+      "exclude_flagged_events": true,
+      "exclude_stale_messages": true,
+      "latch_once_triggered": true,
+      "calibration_window_fraction": 0.1,
+      "calibration_percentile": 99.9,
+      "calibration_margin": 1.5,
+      "threshold_current_consistency": 4.791456886480002,
+      "threshold_cusum": 3.841373697932582e-05,
+      "cusum_slack": 0.0009740885416666676,
+      "calibration_note": "thresholds are computed by revision2_experiments.py from FAULT-FREE runs on the first 10 % of the horizon (5 seeds, lambda=1) and written back into this file; they are never tuned by looking at the fault classes"
+    }
+  },
+  "baselines": [
+    "ABR-full (statistical detector + physical-consistency router)",
+    "ABR-no-router (gap -> quarantine directly; round-1 behaviour)",
+    "Median/MAD instantaneous z>3",
+    "Fixed absolute threshold 3 %",
+    "Fixed absolute threshold 5 %",
+    "PBFT-BMS trimmed mean (f trimmed each side)",
+    "Centralised mean fusion (no detection)"
+  ],
+  "experiments": {
+    "E7": "fault-class discrimination matrix (16 classes x 7 detectors)",
+    "E8": "honest-dispersion sweep lambda in {0.25,0.5,1,2,4,8}",
+    "E9": "fault magnitude vs honest spread (N5 bias sweep, N1 current sweep)",
+    "E10": "calibration against the real cell-voltage envelope",
+    "E11": "voltage-anchor sensitivity (replaces Table 11)",
+    "E1p": "detector ablation (EWMA / gap / router) on the v3 signal model",
+    "E2p": "gap-threshold sweep on the v3 signal model",
+    "E6p": "centralised vs distributed on the v3 signal model"
+  },
+  "evaluation": {
+    "metrics": [
+      "tpr_steps",
+      "fpr_steps",
+      "latency_steps",
+      "latency_hours",
+      "rmse_consensus",
+      "state_partition"
+    ],
+    "ground_truth_consensus": "mean over the 16 groups of the true module SOC",
+    "aggregation": "mean +/- std over the 5 seeds, per-seed values also stored"
+  }
+}

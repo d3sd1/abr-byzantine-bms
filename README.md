@@ -1,75 +1,125 @@
+# Byzantine-Resilient Consensus for Distributed BMS — Reproducibility Package
+
+Code and experiment scripts for the manuscript
+
+> **Byzantine-Resilient Consensus for Distributed Battery Management:
+> separating node faults from battery faults on 70 days of real LiFePO4 field data**
+
+(Applied Energy; previous submission APEN-D-26-09704R1.)
+
 ## Dataset
 
-El Tiemblo Solar+Storage LiFePO4 dataset (70 days, 22,524 samples) on Zenodo:
+El Tiemblo Solar+Storage LiFePO4 dataset (70 days, 22 524 samples) on Zenodo:
 **DOI [10.5281/zenodo.20717244](https://doi.org/10.5281/zenodo.20717244)** (CC-BY-4.0).
 
-# ABR Byzantine-Resilient BMS — Reproducibility Package
+The package has **two generations of experiments**. Both are kept, because the
+second one exists to answer specific reviewer objections to the first and the
+comparison is part of the argument.
 
-Code and experiment scripts for the paper:
+| Generation | Scripts | What it is |
+|---|---|---|
+| **v3 (round 2, current)** | `signal_model.py`, `faults.py`, `abr_detector.py`, `revision2_experiments.py`, `generate_figures_v3.py` | Signal-level fault injection, physically grounded module dispersion, battery-fault taxonomy, physical-consistency router |
+| **v1/v2 (round 1, provenance)** | `run_evaluation.py`, `revision_experiments.py`, `run_sensitivity.py`, `generate_figures.py` | Report-level fault injection, module SOC = pack SOC + N(0, 0.005). Kept unmodified so the round-1 numbers remain reproducible |
 
-> **Trust-Weighted Byzantine-Resilient Consensus for Distributed Battery
-> Management Systems: A Statistical Fault Detector Validated on 70 Days of
-> Real LiFePO4 Solar Data**
+## Why the experiments were rebuilt
 
-This repository reproduces all experimental results (detector ablation,
-robustness/threshold sweep, interpolation sensitivity, PINN-vs-filter
-comparison, public-dataset cross-validation, and centralised-vs-distributed
-evaluation) and regenerates every figure programmatically.
+Two reviewers showed that the round-1 validation did not exercise the claim the
+paper makes.
+
+* Faults were injected by editing the final SOC number a node reported, so the
+  central claim — that a healthy-but-aged module is not mistaken for a
+  misbehaving node — was never tested.
+* `simulate_modules` set every module's SOC to the pack SOC plus N(0, 0.005),
+  making the 16 nodes near-copies of one another.
+* Nothing in the round-1 taxonomy said anything about internal short circuit or
+  cell imbalance.
+* Table 11 showed the consensus RMSE identical to five decimals across four
+  interpolation schemes, i.e. the per-module detail did not contribute.
+
+The v3 package addresses each of these. It also fixes two defects found while
+rebuilding, both documented in `REVISION2_RESULTS.md`: the round-1 code
+integrated current with the **wrong sign** for this dataset, and it kept the
+full-rate `dt` after subsampling, under-counting charge throughput by ~2x.
 
 ## Contents
 
 | File | Purpose |
-|------|---------|
-| `revision_experiments.py` | Experiments E1–E6 (ablation, robustness, interpolation, PINN-vs-filter, NASA PCoE cross-validation, centralised vs distributed) |
-| `run_evaluation.py` | Main detector / consensus evaluation on the El Tiemblo dataset |
-| `run_sensitivity.py` | Hyperparameter sensitivity sweeps (lambda_phys, w1, gap threshold) |
-| `generate_figures.py` | Regenerates figR1–figR5 (PDF) from `results/` |
-| `generate_graphical_abstract.py` | Graphical abstract |
-| `requirements.txt` | Pinned Python dependencies |
-| `results/` | Aggregated results (JSON), 5 seeds: 42, 123, 456, 789, 1024 |
-| `figures/` | Generated figures (PDF) |
+|---|---|
+| `config_v3.json` | Every parameter: signal model, fault classes, detector, router thresholds, seeds |
+| `signal_model.py` | Per-module signal reconstruction anchored to the measured cell-voltage envelope + honest local estimator |
+| `faults.py` | 16 fault classes in three families (node / glitch / battery), injected at signal or message level |
+| `abr_detector.py` | Statistical detector + physical-consistency router, and all baselines |
+| `revision2_experiments.py` | E7–E11 and E1'/E2'/E6' |
+| `generate_figures_v3.py` | figR6–figR9, figR1v3, figR2v3, figR5v3 |
+| `generate_graphical_abstract_v3.py` | Graphical abstract (numbers read from the results JSON) |
+| `results/revision2_results.json` | All round-2 results, mean ± std over 5 seeds plus per-seed values |
+| `results/aggregated_results.json` | Consolidated; round-2 results live under the `v3` key |
+| `REVISION2_RESULTS.md` | Round-2 findings, including the unfavourable ones |
+| `REVISION_RESULTS.md` | Round-1 findings (provenance) |
 
 ## Requirements
 
-- Python 3.11+
-- See `requirements.txt` (numpy, pandas, scipy, matplotlib, scikit-learn)
+- Python 3.11+ (developed on 3.13.7)
+- `pip install -r requirements.txt` (numpy, pandas, scipy, matplotlib, scikit-learn)
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
+.venv/Scripts/activate          # Windows;  source .venv/bin/activate elsewhere
 pip install -r requirements.txt
 ```
 
 ## Data
 
-The El Tiemblo 70-day LiFePO4 solar-storage dataset (22,524 samples,
-16 modules) is released separately on Zenodo with a persistent DOI (see the
-paper's Data Availability statement). Place the dataset CSV under a top-level
-`datasets/` directory as referenced in `run_evaluation.py` and
-`revision_experiments.py`.
+The El Tiemblo 70-day LiFePO4 solar-storage dataset (22 524 samples, 16s16p
+pack) is released separately with a persistent DOI; see the manuscript's Data
+Availability statement. Place the CSV at
 
-The public cross-validation dataset is the NASA Prognostics Center of
-Excellence (PCoE) Li-ion battery aging dataset (cells B5/B6/B7), publicly
-available from the NASA PCoE data repository. Save it as
-`datasets/Battery_dataset.csv`.
+```
+<repo-parent>/datasets/eltiemblo_solar_completo/848299_0_Hock_log_20250101-0000_to_20251231-2358.csv
+```
 
-## Reproducing the results
+or edit `DATA_FILE` in `signal_model.py`. The round-1 cross-validation set is
+the NASA PCoE Li-ion aging dataset (cells B5/B6/B7), saved as
+`datasets/Battery_dataset.csv`; it is used only by `revision_experiments.py`.
+
+**Current sign convention.** Positive current is charging. This was verified
+against the data rather than assumed: mean `I_pack` is +175.7 A over samples
+where the BMS SOC rises and −56.2 A where it falls, and the windowed regression
+of ΔSOC on ∫I dt has a positive slope. `run_evaluation.py` (round 1) integrated
+with the opposite sign.
+
+## Reproducing the round-2 results
 
 ```bash
-# Experiments E1–E6 (revision experiments)
-python revision_experiments.py
+python revision2_experiments.py          # E7-E11, E1', E2', E6'  (~30 min, CPU only)
+python generate_figures_v3.py            # all round-2 figures
+python generate_graphical_abstract_v3.py # graphical abstract
+```
 
-# Main evaluation and sensitivity sweeps
+`revision2_experiments.py` first calibrates the router thresholds on
+**fault-free** runs over the first 10 % of the horizon, writes them back into
+`config_v3.json` under `detector.router`, and then freezes them. The thresholds
+are never set by looking at the fault classes.
+
+Every stochastic experiment runs over the 5 fixed seeds 42, 123, 456, 789, 1024;
+reported metrics are mean ± std over those seeds, and the per-seed values are
+stored in the JSON.
+
+### Measured runtime
+
+`revision2_experiments.py`: **see `_meta.runtime_seconds` in
+`results/revision2_results.json`** (about 30 minutes on a CPU-only desktop,
+single-threaded NumPy). Figures add roughly one minute.
+
+## Reproducing the round-1 results (provenance)
+
+```bash
+python revision_experiments.py
 python run_evaluation.py
 python run_sensitivity.py
-
-# Regenerate all figures from results/
 python generate_figures.py
 ```
 
-All stochastic experiments are run over 5 fixed seeds (42, 123, 456, 789,
-1024); reported metrics are mean ± std over those seeds.
-
 ## License
 
-MIT License — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE).
